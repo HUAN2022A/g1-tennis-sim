@@ -14,6 +14,9 @@ Usage:
     # Real robot
     python -m deploy.play_track --real --net enx6c1ff7579fdf
 
+    # Simulation (tennis scene: racket + ball + court, interactive)
+    python -m deploy.play_track --tennis --racket_mass 0.05
+
 Modes (keyboard number keys):
     0 = Walk policy
     1 = Online retarget (mocap)
@@ -43,6 +46,7 @@ from utils.sim_mj import get_sensor_data as mj_sensor
 from tracking.policy import Args as PolicyArgs, get_policy_onnx
 from tracking.infer_utils import G1TrackMjSim, G1TrackInferFn, g1_infer_env_config, apply_ema_qpos
 from utils.ref_ghost import RefGhostRenderer
+from utils.tennis_scene import load_tennis_model, reset_ball, get_ball_qposadr
 
 from deploy.walk_policy import WalkPolicy
 from deploy.keyboard_cmd import DeployKeyboardCMD
@@ -217,9 +221,17 @@ class LiveRefConverter:
         return qpos
 
     def convert(self, qpos_full: np.ndarray) -> dict:
-        """Convert a single qpos_full (36,) to ref_state dict (batch dim = 1)."""
+        """Convert a single qpos_full (36,) to ref_state dict (batch dim = 1).
+
+        网球场景（nq=43）时只填充机器人 36 维，尾部网球 freejoint
+        四元数保持单位（与 utils/ref_ghost.py 的适配方式一致）。
+        """
         qpos_full = self._rebias_qpos(qpos_full)
-        self.mj_data.qpos[:] = qpos_full
+        self.mj_data.qpos[:] = 0.0
+        n_q = min(self.mj_model.nq, len(qpos_full))
+        self.mj_data.qpos[:n_q] = qpos_full[:n_q]
+        if self.mj_model.nq > len(qpos_full):
+            self.mj_data.qpos[len(qpos_full) + 3:len(qpos_full) + 7] = (1, 0, 0, 0)
         self.mj_data.qvel[:] = 0.0
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
@@ -382,10 +394,30 @@ def run_sim(args: "DeployArgs"):
 
     # MuJoCo sim (correct sim_dt=0.001 from Humanoid-GPT)
     init_qpos = consts.DEFAULT_QPOS.copy()
-    mj_sim = G1TrackMjSim(init_qpos=init_qpos, headless=False, ctrl_dt=ctrl_dt)
+    if args.tennis:
+        # 网球场景：先按 tennis XML 建 G1TrackMjSim（拿到 viewer 等基础设施），
+        # 再用 MjSpec 版本（含动态挂接的球拍）替换模型。nq=43（机器人 36 + 球 7），
+        # init_qpos 需扩到完整 nq，球四元数保持单位。
+        mj_sim = G1TrackMjSim(
+            init_qpos=init_qpos, headless=False, ctrl_dt=ctrl_dt,
+            xml_path=str(consts.ROOT_PATH / "scene_tennis.xml"),
+        )
+        mj_sim.mj_model = load_tennis_model(racket_mass=args.racket_mass)
+        mj_sim.mj_model.opt.timestep = 0.001
+        full_init = np.zeros(mj_sim.mj_model.nq)
+        full_init[:36] = mj_sim.init_qpos
+        full_init[get_ball_qposadr(mj_sim.mj_model) + 3] = 1.0  # 球四元数 w=1
+        mj_sim.init_qpos = full_init
+        tennis_mode = True
+    else:
+        mj_sim = G1TrackMjSim(init_qpos=init_qpos, headless=False, ctrl_dt=ctrl_dt)
+        tennis_mode = False
     infer_fn = G1TrackInferFn(env_cfg, mj_sim.mj_model, track_policy, privileged=False)
     state = mj_sim.init_state()
     state = mj_sim.reset(state)
+    if tennis_mode:
+        # 模型在 init_state 之后替换过，重置一次球状态（reset 后球按默认位置摆好）
+        reset_ball(state.mj_data, mj_sim.mj_model)
     ref_ghost = RefGhostRenderer(mj_sim.mj_model)
 
     # Camera view: match inference.py
@@ -422,6 +454,14 @@ def run_sim(args: "DeployArgs"):
         except Exception as e:
             print(f"[Mocap] Failed to start retarget: {e}. Online mode disabled.")
 
+    # Tennis scene helper: 球在 reset() 后回到默认位（含球四元数单位化），
+    # 再把球摆到发球位置 (2, 0, 1)，避免球停在原点与机器人初始位姿重叠。
+    def _reset_sim(state):
+        state = mj_sim.reset(state)
+        if tennis_mode:
+            reset_ball(state.mj_data, mj_sim.mj_model)
+        return state
+
     rate = RateLimiter(frequency=freq, warn=False)
     last_mode = 0
     track_step = 0
@@ -436,7 +476,7 @@ def run_sim(args: "DeployArgs"):
     try:
         while True:
             if keyboard.check_reset_request():
-                state = mj_sim.reset(state)
+                state = _reset_sim(state)
                 infer_fn.info["last_action"][:] = 0
                 infer_fn.info["step"] = 0
                 live_converter.reset()
@@ -458,7 +498,7 @@ def run_sim(args: "DeployArgs"):
                 if mode >= 2:
                     traj_idx = mode - 2
                     if traj_idx < len(ref_motions):
-                        state = mj_sim.reset(state)
+                        state = _reset_sim(state)
                         ref_traj = ref_motions[traj_idx]["data"]
                         track_step = 0
                         traj_filename = ref_motions[traj_idx]["filename"]
@@ -493,16 +533,24 @@ def run_sim(args: "DeployArgs"):
 
             if mode == 0:
                 # Walk policy
+                # 网球场景 nq=43：机器人关节固定为 qpos[7:36]/qvel[6:35]，
+                # 尾部网球 freejoint 不参与步行控制
+                if mj_sim.mj_model.nq > 36:
+                    jnt_qpos = state.mj_data.qpos[7:36]
+                    jnt_qvel = state.mj_data.qvel[6:35]
+                else:
+                    jnt_qpos = state.mj_data.qpos[7:]
+                    jnt_qvel = state.mj_data.qvel[6:]
                 cmd_vel = np.array([cmd.vel_lin_x, cmd.vel_lin_y, cmd.vel_ang_yaw], dtype=np.float32)
                 gyro = mj_sensor(mj_sim.mj_model, state.mj_data, "gyro_pelvis")
                 motor_targets = walk_policy.infer(
                     state.mj_data.qpos[3:7], gyro,
-                    state.mj_data.qpos[7:], state.mj_data.qvel[6:],
+                    jnt_qpos, jnt_qvel,
                     cmd_vel,
                 )
                 # Walk uses different PD gains than tracking
                 for _ in range(mj_sim.num_sim_substeps):
-                    torques = KPs_walking * (motor_targets - state.mj_data.qpos[7:]) + KDs_walking * (-state.mj_data.qvel[6:])
+                    torques = KPs_walking * (motor_targets - jnt_qpos) + KDs_walking * (-jnt_qvel)
                     torques = np.clip(torques, -consts.TORQUE_LIMIT, consts.TORQUE_LIMIT)
                     state.mj_data.ctrl[:] = torques
                     mujoco.mj_step(mj_sim.mj_model, state.mj_data)
@@ -801,6 +849,10 @@ class DeployArgs:
     real: bool = False
     debug: bool = False
     freq: int = 50
+
+    # 网球场景（仿真模式）：scene_tennis.xml + 动态挂拍，nq=43（机器人 36 + 球 7）
+    tennis: bool = False
+    racket_mass: float = 0.05  # 已验证的轻量拍（50g）；训练时手上无质量，加重会失稳
 
     # Mocap
     no_mocap: bool = False
