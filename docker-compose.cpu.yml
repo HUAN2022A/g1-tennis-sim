@@ -1,0 +1,17 @@
+name: humanoid-gpt
+
+services:
+  inference:
+    image: humanoid-gpt:latest
+    build: .
+    volumes:
+      - ./storage:/workspace/Humanoid-GPT/storage
+    working_dir: /workspace/Humanoid-GPT
+    # CPU-only: eval_parallel spawns worker processes, each may need ~1-2GB
+    command: >
+      python3 -m scripts.inference
+      --onnx_track storage/ckpts/pns_wo_priv264.onnx
+      --track_dir storage/test
+      --headless
+    mem_limit: 8g
+    cpus: 8

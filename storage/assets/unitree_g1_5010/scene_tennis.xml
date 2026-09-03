@@ -1,0 +1,204 @@
+<mujoco model="g1 tennis scene (racket + ball + court)">
+    <!--
+      带球拍的网球场景：在 scene_mjx_track.xml 基础上增加
+      1. 右手持拍（参考 noitom-robotics/AdaPT g1_rightracket.xml 的挂接方式，
+         拍面网格用圆柱代理碰撞体，拍子是 wrist_yaw_link 下的无关节刚体，nq 保持 36）
+      2. 网球（物理参数参考 wfzark/tennis-robot-rl：半径 0.0335 m，质量 0.0577 kg）
+      3. 球场 + 球网（标准尺寸：半场 11.885 m，网高中心 0.914 m / 柱 1.07 m）
+      注意：跟踪策略训练时手上无球拍质量，球拍惯量会使挥拍跟踪变差；
+      默认用轻量拍（0.3 kg）先打通链路。
+    -->
+    <include file="g1_mjx_track.xml"/>
+    <statistic center="0 0 0.7" extent="1.2" meansize="0.02"/>
+
+    <visual>
+        <headlight diffuse=".9 .9 .9" ambient=".2 .2 .2" specular="1 1 1"/>
+        <rgba force="1 0 0 1"/>
+        <global azimuth="140" elevation="-20"/>
+        <map force="0.01"/>
+        <scale forcewidth="0.3" contactwidth="0.5" contactheight="0.2"/>
+        <quality shadowsize="8192"/>
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+                 markrgb="0.8 0.8 0.8" width="300" height="300"/>
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+        <material name="court" rgba="0.18 0.42 0.30 1"/>
+        <material name="net_white" rgba="0.95 0.95 0.95 1"/>
+        <material name="racket_frame" rgba="0.15 0.15 0.18 1"/>
+        <material name="tennis_ball" rgba="0.82 0.92 0.18 1"/>
+    </asset>
+
+    <worldbody>
+        <light directional="true" pos="-0.5 0.5 3" dir="0.2 -0.2 -1" diffuse="0.9 0.9 0.9"/>
+        <geom name="floor" size="0 0 0.01" type="plane" material="groundplane"/>
+
+        <!-- 网球（初始静止在发球线附近，后续由脚本设置位置/速度） -->
+        <body name="tennis_ball" pos="2.0 0 1.0">
+            <freejoint name="tennis_ball_free"/>
+            <geom name="tennis_ball_geom" type="sphere" size="0.0335" mass="0.0577"
+                  material="tennis_ball" condim="3"
+                  friction="0.55 0.005 0.0001"
+                  solref="0.01 0.2" solimp="0.95 0.99 0.001 0.5 2"
+                  contype="1" conaffinity="1"/>
+        </body>
+
+        <!-- 球网：沿 y 轴，位于 x=0；总长 12.8 m（半场宽 11.885 m + 两侧外扩），中心高 0.914 m -->
+        <body name="net" pos="0 0 0">
+            <!-- 网带（顶沿） -->
+            <geom name="net_band" type="box" size="0.02 6.4 0.02" pos="0 0 0.914"
+                  material="net_white" contype="0" conaffinity="0"/>
+            <!-- 网面（薄盒近似，含拖地部分 0.914-0.02 高） -->
+            <geom name="net_face" type="box" size="0.005 6.4 0.447" pos="0 0 0.447"
+                  rgba="0.85 0.85 0.85 0.35" contype="1" conaffinity="1" condim="3"
+                  friction="0.3 0.005 0.0001" solref="0.005 1"/>
+            <!-- 两根网柱（高 1.07 m） -->
+            <geom name="net_post_left" type="cylinder" size="0.04 0.535" pos="0 -6.4 0.535"
+                  material="net_white" contype="1" conaffinity="1" condim="3"/>
+            <geom name="net_post_right" type="cylinder" size="0.04 0.535" pos="0 6.4 0.535"
+                  material="net_white" contype="1" conaffinity="1" condim="3"/>
+        </body>
+
+        <!-- 球场白线（薄盒，仅视觉） -->
+        <geom name="court_baseline" type="box" size="0.05 5.485 0.005" pos="11.885 0 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_sideline_l" type="box" size="5.97 0.05 0.005" pos="5.97 5.485 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_sideline_r" type="box" size="5.97 0.05 0.005" pos="5.97 -5.485 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_singles_l" type="box" size="5.97 0.05 0.005" pos="5.97 4.115 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_singles_r" type="box" size="5.97 0.05 0.005" pos="5.97 -4.115 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_service_line" type="box" size="0.05 4.115 0.005" pos="6.4 0 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+        <geom name="court_center_line" type="box" size="2.735 0.05 0.005" pos="9.14 0 0.005"
+              rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+    </worldbody>
+
+    <!-- 球拍注入点：见 g1_mjx_track.xml 中 right_wrist_yaw_link 末尾的注释，
+         由 utils/tennis_scene.py 在加载后用 MuJoCo attachment API 动态挂接。 -->
+
+    <contact>
+        <!-- left foot - floor -->
+        <pair name="left_foot1_floor" geom1="left_foot1_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <pair name="left_foot2_floor" geom1="left_foot2_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <pair name="left_foot3_floor" geom1="left_foot3_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <!-- right foot - floor -->
+        <pair name="right_foot1_floor" geom1="right_foot1_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <pair name="right_foot2_floor" geom1="right_foot2_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <pair name="right_foot3_floor" geom1="right_foot3_collision" geom2="floor" solref="0.008 1" friction="1 1"
+              condim="3"/>
+        <!-- foot - foot -->
+        <pair name="left_foot_right_foot" geom1="left_foot_box_collision" geom2="right_foot_box_collision" condim="1"/>
+        <!-- foot - shin -->
+        <pair name="left_foot_right_shin" geom1="left_foot_box_collision" geom2="right_shin_collision" condim="1"/>
+        <pair name="right_foot_left_shin" geom1="right_foot_box_collision" geom2="left_shin_collision" condim="1"/>
+        <!-- foot - linkage brace -->
+        <pair name="left_foot_right_linkage_brace" geom1="left_foot_box_collision" geom2="right_linkage_brace_collision"
+              condim="1"/>
+        <pair name="right_foot_left_linkage_brace" geom1="right_foot_box_collision" geom2="left_linkage_brace_collision"
+              condim="1"/>
+        <!-- hands - hips -->
+        <pair name="left_hand_left_hip" geom1="left_hand_collision" geom2="left_hip_collision" condim="1"/>
+        <pair name="right_hand_right_hip" geom1="right_hand_collision" geom2="right_hip_collision" condim="1"/>
+        <!-- hands - thigh -->
+        <pair name="left_hand_left_thigh" geom1="left_hand_collision" geom2="left_thigh_collision" condim="1"/>
+        <pair name="right_hand_right_thigh" geom1="right_hand_collision" geom2="right_thigh_collision" condim="1"/>
+        <!-- shins - shins -->
+        <pair name="left_shin_right_shin" geom1="left_shin_collision" geom2="right_shin_collision" condim="1"/>
+        <!-- torso - shoulders -->
+        <pair name="torso_left_shoulder" geom1="torso_collision" geom2="left_shoulder_yaw_collision" condim="1"/>
+        <pair name="torso_right_shoulder" geom1="torso_collision" geom2="right_shoulder_yaw_collision" condim="1"/>
+        <!-- torso - elbows -->
+        <pair name="torso_left_elbow" geom1="torso_collision" geom2="left_elbow_yaw_collision" condim="1"/>
+        <pair name="torso_right_elbow" geom1="torso_collision" geom2="right_elbow_yaw_collision" condim="1"/>
+        <!-- torso - wrist -->
+        <pair name="torso_left_wrist" geom1="torso_collision" geom2="left_wrist_collision" condim="1"/>
+        <pair name="torso_right_wrist" geom1="torso_collision" geom2="right_wrist_collision" condim="1"/>
+        <!-- torso - hands -->
+        <pair name="torso_left_hand" geom1="torso_collision" geom2="left_hand_collision" condim="1"/>
+        <pair name="torso_right_hand" geom1="torso_collision" geom2="right_hand_collision" condim="1"/>
+        <!-- pelvis - wrist -->
+        <pair name="pelvis_left_wrist" geom1="pelvis_collision" geom2="left_wrist_collision" condim="1"/>
+        <pair name="pelvis_right_wrist" geom1="pelvis_collision" geom2="right_wrist_collision" condim="1"/>
+        <!-- pelvis - hands -->
+        <pair name="pelvis_left_hand" geom1="pelvis_collision" geom2="left_hand_collision" condim="1"/>
+        <pair name="pelvis_right_hand" geom1="pelvis_collision" geom2="right_hand_collision" condim="1"/>
+        <!-- hands - floor -->
+        <pair name="left_hand_floor" geom1="left_hand_collision" geom2="floor" condim="3"/>
+        <pair name="right_hand_floor" geom1="right_hand_collision" geom2="floor" condim="3"/>
+        <!-- shoulder - floor -->
+        <pair name="left_shoulder_floor" geom1="left_shoulder_yaw_collision" geom2="floor" condim="3"/>
+        <pair name="right_shoulder_floor" geom1="right_shoulder_yaw_collision" geom2="floor" condim="3"/>
+        <!-- elbow - floor -->
+        <pair name="left_elbow_floor" geom1="left_elbow_yaw_collision" geom2="floor" condim="3"/>
+        <pair name="right_elbow_floor" geom1="right_elbow_yaw_collision" geom2="floor" condim="3"/>
+        <!-- wrist - floor -->
+        <pair name="left_wrist_floor" geom1="left_wrist_collision" geom2="floor" condim="3"/>
+        <pair name="right_wrist_floor" geom1="right_wrist_collision" geom2="floor" condim="3"/>
+        <!-- racket - ball 的接触对由 utils/tennis_scene.py 在 MjSpec 挂接球拍时添加
+             （XML 中不存在 racket_collision geom，不能静态声明） -->
+        <!-- hips - floor -->
+        <pair name="left_hip_floor" geom1="left_hip_collision" geom2="floor" condim="3"/>
+        <pair name="right_hip_floor" geom1="right_hip_collision" geom2="floor" condim="3"/>
+        <!-- thigh - floor -->
+        <pair name="left_thigh_floor" geom1="left_thigh_collision" geom2="floor" condim="3"/>
+        <pair name="right_thigh_floor" geom1="right_thigh_collision" geom2="floor" condim="3"/>
+        <!-- thigh - hand -->
+        <pair name="left_thigh_hand" geom1="left_thigh_collision" geom2="left_hand_collision" condim="3"/>
+        <pair name="right_thigh_hand" geom1="right_thigh_collision" geom2="right_hand_collision" condim="3"/>
+        <!-- shins - floor -->
+        <pair name="left_shin_floor" geom1="left_shin_collision" geom2="floor" condim="3"/>
+        <pair name="right_shin_floor" geom1="right_shin_collision" geom2="floor" condim="3"/>
+        <!-- pelvis - floor -->
+        <pair name="pelvis_floor" geom1="pelvis_collision" geom2="floor" condim="3"/>
+        <!-- torso - floor -->
+        <pair name="torso_floor" geom1="torso_collision" geom2="floor" condim="3"/>
+        <!-- head - floor -->
+        <pair name="head_floor" geom1="head_collision" geom2="floor" condim="3"/>
+        <!-- head - hand -->
+        <pair name="head_left_hand" geom1="head_collision" geom2="left_hand_collision" condim="1"/>
+        <pair name="head_right_hand" geom1="head_collision" geom2="right_hand_collision" condim="1"/>
+        <!-- thigh - thigh -->
+        <pair name="left_thigh_right_thigh" geom1="left_thigh_collision" geom2="right_thigh_collision" condim="1"/>
+        <!-- shin - thigh -->
+        <pair name="left_shin_right_thigh" geom1="left_shin_collision" geom2="right_thigh_collision" condim="1"/>
+        <pair name="right_shin_left_thigh" geom1="right_shin_collision" geom2="left_thigh_collision" condim="1"/>
+        <!-- hip - shin -->
+        <pair name="left_shin_right_hip" geom1="left_shin_collision" geom2="right_hip_collision" condim="1"/>
+        <pair name="right_shin_left_hip" geom1="right_shin_collision" geom2="left_hip_collision" condim="1"/>
+        <!-- hip - thigh -->
+        <pair name="left_hip_right_thigh" geom1="left_hip_collision" geom2="right_thigh_collision" condim="1"/>
+        <pair name="right_hip_left_thigh" geom1="right_hip_collision" geom2="left_thigh_collision" condim="1"/>
+        <!-- hand - hand -->
+        <pair name="left_hand_right_hand" geom1="left_hand_collision" geom2="right_hand_collision" condim="1"/>
+    </contact>
+
+    <keyframe>
+        <key name="home"
+             qpos="
+      0 0 0.783675
+      1 0 0 0
+      -0.1 0 0 0.3 -0.2 0
+      -0.1 0 0 0.3 -0.2 0
+      0 0 0
+      0.2 0.2 0 1.28 0 0 0
+      0.2 -0.2 0 1.28 0 0 0
+      "
+             ctrl="
+      -0.1 0 0 0.3 -0.2 0
+      -0.1 0 0 0.3 -0.2 0
+      0 0 0
+      0.2 0.2 0 1.28 0 0 0
+      0.2 -0.2 0 1.28 0 0 0
+      "/>
+    </keyframe>
+</mujoco>

@@ -51,6 +51,11 @@ class InferenceArgs(Args):
     freq: int = 50
     convert_xml_path: str = str(consts.TRACK_XML)
     show_ref_ghost: bool = False
+    # 逐帧导出目录：每条轨迹保存一个 NPZ（ref/actual qpos、obs、nn_action、motor_targets、torque、误差）
+    export_dir: str = None
+    # 网球场景：加载 scene_tennis.xml（右手持拍 + 网球 + 球场），racket_mass 可调
+    tennis: bool = False
+    racket_mass: float = 0.3
 
 
 def _load_npz_with_qpos(file_path: Path) -> dict:
@@ -113,7 +118,22 @@ def main(args: InferenceArgs):
 
     _init_qpos = traj_data[0]["qpos"][0]
     _init_qpos[:2] = 0.0
-    mj_sim = G1TrackMjSim(init_qpos=_init_qpos, headless=args.headless, ctrl_dt=env_cfg.ctrl_dt)
+    if args.tennis:
+        from utils.tennis_scene import load_tennis_model, reset_ball, get_ball_qposadr
+        mj_sim = G1TrackMjSim(init_qpos=_init_qpos, headless=args.headless, ctrl_dt=env_cfg.ctrl_dt,
+                              xml_path=str(consts.ROOT_PATH / "scene_tennis.xml"))
+        # G1TrackMjSim 内部从 XML 加载（不含球拍），用 MjSpec 版本替换；
+        # init_qpos 需扩到完整 nq（含网球 freejoint），机器人部分保持 36 维
+        mj_sim.mj_model = load_tennis_model(racket_mass=args.racket_mass)
+        mj_sim.mj_model.opt.timestep = 0.001
+        _full_init = np.zeros(mj_sim.mj_model.nq)
+        _full_init[:36] = mj_sim.init_qpos
+        _full_init[get_ball_qposadr(mj_sim.mj_model) + 3] = 1.0  # 球四元数 w=1
+        mj_sim.init_qpos = _full_init
+        ball_adr = get_ball_qposadr(mj_sim.mj_model)
+    else:
+        mj_sim = G1TrackMjSim(init_qpos=_init_qpos, headless=args.headless, ctrl_dt=env_cfg.ctrl_dt)
+        ball_adr = None
 
     if not args.onnx_track.endswith(".onnx"):
         raise ValueError(f"Unsupported onnx_track format: {args.onnx_track} (expected .onnx)")
@@ -145,15 +165,17 @@ def main(args: InferenceArgs):
 
         _init_qpos = traj_data[traj_id]["qpos"][0]
         _init_qpos[:2] = 0.0
-        mj_sim.init_qpos[:] = _init_qpos
+        mj_sim.init_qpos[:36] = _init_qpos
         state = mj_sim.reset(state)
 
         # If reference trajectory contains qvel, strictly restore initial state using qpos + qvel
         if "qvel" in ref_traj:
             _init_qvel = ref_traj["qvel"][0]
-            state.mj_data.qpos[:] = _init_qpos
-            state.mj_data.qvel[:] = _init_qvel
+            state.mj_data.qpos[:7] = _init_qpos[:7]
+            state.mj_data.qvel[:6] = _init_qvel[:6]
             mujoco.mj_forward(mj_sim.mj_model, state.mj_data)
+        if ball_adr is not None:
+            reset_ball(state.mj_data, mj_sim.mj_model)
         if data_path.is_file():
             file_name = data_path.name
         else:
@@ -172,12 +194,32 @@ def main(args: InferenceArgs):
             'state_history': []
         }
 
+        # Per-frame export buffers
+        export = {
+            'ref_qpos': [],
+            'actual_qpos': [],
+            'actual_qvel': [],
+            'obs': [],
+            'nn_action': [],
+            'motor_targets': [],
+            'torque': [],
+            'kpt_pos_errors': [],
+            'kpt_rot_errors': [],
+            'joint_pos_errors': [],
+            'joint_vel_errors': [],
+            'root_pos_errors': [],
+            'root_vel_errors': [],
+            'root_yaw_errors': [],
+        }
+
         for track_step in tqdm(range(traj_len), desc=f"Trajectory {traj_id}", leave=False):
             ref_curr = jtu.tree_map(lambda x: x[track_step][None], ref_traj)
             track_step_next = np.clip(track_step + 1, 0, traj_len - 1)
             ref_next = jtu.tree_map(lambda x: x[track_step_next][None], ref_traj)
 
             action = infer_fn.infer_onnx(state, {"ref_curr": ref_curr, "ref_next": ref_next})
+            motor_targets = np.asarray(action).flatten()
+            torque_last = state.mj_data.ctrl.copy()
             state = mj_sim.step(state, action)
 
             # Calculate metrics using new methods
@@ -193,6 +235,22 @@ def main(args: InferenceArgs):
             traj_metrics['root_pos_errors'].append(root_pos_err_mm)
             traj_metrics['root_vel_errors'].append(root_vel_err_mms)
             traj_metrics['root_yaw_errors'].append(root_yaw_err)
+
+            if args.export_dir is not None:
+                export['ref_qpos'].append(ref_curr["qpos"][0].copy())
+                export['actual_qpos'].append(state.mj_data.qpos.copy())
+                export['actual_qvel'].append(state.mj_data.qvel.copy())
+                export['obs'].append(infer_fn.info["obs"][0].copy())
+                export['nn_action'].append(infer_fn.info["nn_action"][0].copy())
+                export['motor_targets'].append(motor_targets.copy())
+                export['torque'].append(torque_last.copy())
+                export['kpt_pos_errors'].append(kpt_pos_mae)
+                export['kpt_rot_errors'].append(kpt_rot_mae)
+                export['joint_pos_errors'].append(joint_pos_mae)
+                export['joint_vel_errors'].append(joint_vel_mae)
+                export['root_pos_errors'].append(root_pos_err_mm)
+                export['root_vel_errors'].append(root_vel_err_mms)
+                export['root_yaw_errors'].append(root_yaw_err)
 
             # Store state data for trajectory length calculation
             state_data = {
@@ -221,6 +279,35 @@ def main(args: InferenceArgs):
                 if ref_ghost is not None:
                     ref_ghost.add_to_scene(renderer.scene)
                 buf_images.append(renderer.render())
+
+        # Save per-frame export for this trajectory
+        if args.export_dir is not None and len(export['actual_qpos']) > 0:
+            export_path = Path(args.export_dir)
+            export_path.mkdir(parents=True, exist_ok=True)
+            stem = Path(file_name).stem
+            npz_path = export_path / f"{stem}_frames.npz"
+            np.savez_compressed(
+                npz_path,
+                **{k: np.asarray(v) for k, v in export.items()},
+                joint_names=np.array(consts.ACTION_JOINT_NAMES),
+                ctrl_dt=env_cfg.ctrl_dt,
+            )
+            # Flat CSV of scalar per-frame signals for quick inspection
+            csv_path = export_path / f"{stem}_summary.csv"
+            n_frames = len(export['actual_qpos'])
+            header = ("frame,kpt_pos_mae,kpt_rot_mae,joint_pos_mae,joint_vel_mae,"
+                      "root_pos_err_mm,root_vel_err_mms,root_yaw_err")
+            rows = np.column_stack([
+                np.arange(n_frames),
+                export['kpt_pos_errors'], export['kpt_rot_errors'],
+                export['joint_pos_errors'], export['joint_vel_errors'],
+                export['root_pos_errors'], export['root_vel_errors'],
+                export['root_yaw_errors'],
+            ])
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                f.write(header + "\n")
+                np.savetxt(f, rows, fmt=["%d"] + ["%.6f"] * 7, delimiter=",")
+            logging.info(f"    Exported {n_frames} frames -> {npz_path}")
 
         # Calculate final metrics for this trajectory using new method
         actual_trajectory_length = len(ref_traj["qpos"])

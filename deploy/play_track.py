@@ -42,6 +42,7 @@ from utils.transforms_np import base2navi, quat2mat
 from utils.sim_mj import get_sensor_data as mj_sensor
 from tracking.policy import Args as PolicyArgs, get_policy_onnx
 from tracking.infer_utils import G1TrackMjSim, G1TrackInferFn, g1_infer_env_config, apply_ema_qpos
+from utils.ref_ghost import RefGhostRenderer
 
 from deploy.walk_policy import WalkPolicy
 from deploy.keyboard_cmd import DeployKeyboardCMD
@@ -385,6 +386,7 @@ def run_sim(args: "DeployArgs"):
     infer_fn = G1TrackInferFn(env_cfg, mj_sim.mj_model, track_policy, privileged=False)
     state = mj_sim.init_state()
     state = mj_sim.reset(state)
+    ref_ghost = RefGhostRenderer(mj_sim.mj_model)
 
     # Camera view: match inference.py
     if not mj_sim.headless and mj_sim.viewer is not None:
@@ -392,8 +394,8 @@ def run_sim(args: "DeployArgs"):
         viewer_cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer_cam.trackbodyid = 0
         viewer_cam.azimuth = 90.0
-        viewer_cam.elevation = -20.0
-        viewer_cam.distance = 2.0
+        viewer_cam.elevation = -15.0
+        viewer_cam.distance = 3.5
 
     # Live retarget converter
     live_converter = LiveRefConverter(mj_sim.mj_model, ctrl_dt)
@@ -428,6 +430,7 @@ def run_sim(args: "DeployArgs"):
     traj_filename = None
     prev_online_ref = None
 
+    keyboard.set_status("Ready: select a track with keys 2-5")
     print("\n=== Simulation ready. Press number keys to switch modes. ===\n")
 
     try:
@@ -437,13 +440,15 @@ def run_sim(args: "DeployArgs"):
                 infer_fn.info["last_action"][:] = 0
                 infer_fn.info["step"] = 0
                 live_converter.reset()
+                keyboard.set_status("Simulation reset")
                 print("[Reset] Simulation reset.")
 
             cmd = keyboard.step_command()
             mode = cmd.mode
+            mode_triggered = keyboard.consume_mode_trigger()
 
             # Mode transitions
-            entering_track = (last_mode == 0) and (mode >= 1)
+            entering_track = ((last_mode != mode) or mode_triggered) and (mode >= 1)
             leaving_track = (last_mode >= 1) and (mode == 0)
 
             if entering_track:
@@ -453,6 +458,7 @@ def run_sim(args: "DeployArgs"):
                 if mode >= 2:
                     traj_idx = mode - 2
                     if traj_idx < len(ref_motions):
+                        state = mj_sim.reset(state)
                         ref_traj = ref_motions[traj_idx]["data"]
                         track_step = 0
                         traj_filename = ref_motions[traj_idx]["filename"]
@@ -466,11 +472,14 @@ def run_sim(args: "DeployArgs"):
                             "root_yaw_errors": [],
                             "state_history": [],
                         }
+                        keyboard.set_status(f"Tracking: {traj_filename} (0/{len(ref_traj['qpos'])})")
                         print(f"[Track] Start offline: {traj_filename}")
                     else:
+                        keyboard.set_status(f"Invalid track index: {traj_idx}")
                         print(f"[Track] Invalid trajectory index {traj_idx}")
                         mode = 0
                 elif mode == 1:
+                    keyboard.set_status("Online retarget mode")
                     print("[Track] Start online retarget")
 
             if leaving_track:
@@ -479,6 +488,7 @@ def run_sim(args: "DeployArgs"):
                 traj_metrics = None
                 traj_filename = None
                 live_converter.reset()
+                keyboard.set_status("Walk mode")
                 print("[Track] Back to walk mode")
 
             if mode == 0:
@@ -524,6 +534,7 @@ def run_sim(args: "DeployArgs"):
                         state, {"ref_curr": ref_curr, "ref_next": ref_next}
                     )
                     state = mj_sim.step(state, motor_targets)
+                    ref_ghost.set_qpos(ref_curr["qpos"][0])
 
                     # Collect metrics (same as inference.py)
                     if traj_metrics is not None:
@@ -552,14 +563,29 @@ def run_sim(args: "DeployArgs"):
 
                     track_step = track_step + 1
 
+                    if track_step % 25 == 0:
+                        keyboard.set_status(
+                            f"Tracking: {traj_filename} ({track_step}/{traj_len})"
+                        )
+
                     # Print metrics when trajectory completes (after processing last frame)
                     if track_step >= traj_len and traj_metrics is not None and len(traj_metrics["state_history"]) > 0:
                         _print_offline_metrics(traj_metrics, traj_filename, ref_traj, mj_sim.mj_model, ctrl_dt)
+                        completion, _ = calculate_trajectory_length(
+                            traj_metrics["state_history"], ref_traj, mj_sim.mj_model
+                        )
+                        keyboard.set_status(
+                            f"Finished: {traj_filename} (completion {completion:.1%})"
+                        )
                         traj_metrics = None
                         traj_filename = None
                         ref_traj = None  # Avoid index out of bounds on next iteration
 
             last_mode = mode
+            if mj_sim.viewer is not None:
+                ref_ghost.reset_scene(mj_sim.viewer.user_scn)
+                if mode >= 2 and ref_traj is not None:
+                    ref_ghost.add_to_scene(mj_sim.viewer.user_scn)
             mj_sim.view(state)
             rate.sleep()
 

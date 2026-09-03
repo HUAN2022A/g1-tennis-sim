@@ -554,21 +554,59 @@ def qpos2kpt(
     video_width: int = 640,
     video_height: int = 480,
 ):
-    # resample to target rate
+    """将关节位置轨迹（qpos）转换为关键点表示（keypoint representation）
+
+    这是数据预处理的核心函数，将原始动捕数据转换为策略网络使用的关键点格式。
+    主要步骤：
+    1. 重采样：将输入轨迹从源频率插值到目标频率（通常 50Hz）
+    2. 计算速度：从位置差分计算关节速度
+    3. 处理不同关节配置：兼容历史版本的关节数量（66177/66155/66144）
+    4. 高度裁剪：根据脚部位置调整根节点高度，确保脚接触地面
+    5. 平滑首尾：在轨迹开头和结尾添加平滑过渡，避免突变
+    6. 提取关键点：通过 MuJoCo 正运动学计算 14 个关键点的位姿和速度
+    7. 估计脚部接触：根据关键点速度估计左右脚的接触状态
+
+    Args:
+        mj_model: MuJoCo 模型
+        qpos_src: 源关节位置轨迹，形状 (T, 7+N)，其中 N 可能是 29/27/25/23
+        freq_src: 源采样频率（Hz）
+        freq_tgt: 目标采样频率（Hz），通常为 50
+        interp_sec: 平滑过渡时长（秒），在轨迹开头添加从默认站姿到第一帧的过渡
+        end_default_sec: 结束时保持默认站姿的时长（秒）
+        debug: 是否启用调试可视化（显示关键点、速度箭头、接触状态等）
+        foot_contact_est: 是否估计脚部接触状态
+        height_clip_mode: 高度裁剪模式（"first"/"last"/"all"/"all_kpt"），用于确保脚接触地面
+        video_path: 视频保存路径（可选）
+        video_width: 视频宽度
+        video_height: 视频高度
+
+    Returns:
+        kpt_data: 关键点数据字典，包含：
+            - qpos: 关节位置 (T, 36)
+            - qvel: 关节速度 (T, 35)
+            - kpt2gv_pose: 关键点在重力坐标系下的位姿 (T, 14, 4, 4)
+            - kpt_cvel_in_gv: 关键点在重力坐标系下的速度 (T, 14, 6)
+            - gv_vel: 重力坐标系的速度 (T, 3)
+            - gv2wrd_pose: 重力坐标系到世界坐标系的变换 (T, 4, 4)
+            - foot_contact: 脚部接触状态 (T, 2)
+    """
+    # 1. 重采样到目标频率
     qpos_src = resample_state(qpos_src, freq_src, freq_tgt)
     qvel_src = recompute_qvel(qpos_src, freq_tgt)
 
-    # model
+    # 2. 设置 MuJoCo 仿真步长
     sim_dt = 1 / float(freq_tgt)
     mj_model.opt.timestep = sim_dt
 
+    # 3. 处理不同的关节配置（兼容历史版本）
     if qpos_src.shape[1] != 7 + len(ACTION_JOINT_NAMES):
         shape_map = {
-            7 + len(ACTION_JOINT_NAMES_66177): {13, 14},
-            7 + len(ACTION_JOINT_NAMES_66155): {13, 14, 20, 21, 27, 28},
-            7 + len(ACTION_JOINT_NAMES_66144): {13, 14, 19, 20, 21, 26, 27, 28},
+            7 + len(ACTION_JOINT_NAMES_66177): {13, 14},  # 排除腰部 roll/pitch
+            7 + len(ACTION_JOINT_NAMES_66155): {13, 14, 20, 21, 27, 28},  # 排除腰部 roll/pitch 和部分腕关节
+            7 + len(ACTION_JOINT_NAMES_66144): {13, 14, 19, 20, 21, 26, 27, 28},  # 排除更多关节
         }
         if excluded := shape_map.get(qpos_src.shape[1]):
+            # 将排除的关节填充为零，扩展到完整的 29 个关节
             qpos_new = np.zeros((len(qpos_src), 7 + len(ACTION_JOINT_NAMES)))
             qvel_new = np.zeros((len(qpos_src), 6 + len(ACTION_JOINT_NAMES)))
             included = np.setdiff1d(np.arange(29), list(excluded))
@@ -579,7 +617,7 @@ def qpos2kpt(
             qpos_src = qpos_new
             qvel_src = qvel_new
 
-    # physical clip
+    # 4. 物理高度裁剪：确保脚部接触地面
     if height_clip_mode is not None:
         qpos_src = floor_foot_pos_clip_fn(
             mj_model,
@@ -589,7 +627,7 @@ def qpos2kpt(
             body_ids_kpt=[int(mj_model.body(n).id) for n in KPT_NAMES],
         )
 
-    # smooth ramps + ids
+    # 5. 平滑首尾过渡 + 获取关节索引
     qpos_ids = get_qpos_ids(mj_model, ACTION_JOINT_NAMES)
     qvel_ids = get_dof_ids(mj_model, ACTION_JOINT_NAMES)
     if interp_sec > 0.0:
@@ -603,7 +641,7 @@ def qpos2kpt(
             dt=sim_dt,
         )
 
-    # simulate & extract
+    # 6. 仿真并提取关键点
     kpt_data = extract_kpt(
         mj_model,
         qpos_src=qpos_src,
@@ -617,9 +655,11 @@ def qpos2kpt(
         video_height=video_height
     )
 
+    # 7. 估计脚部接触状态
     if foot_contact_est:
         kpt_data["foot_contact"] = contact_estimate(kpt_data["kpt2gv_pose"], kpt_data["gv_vel"])
 
+    # 8. 调试可视化
     if debug:
         import matplotlib
         from loop_rate_limiters import RateLimiter
@@ -649,6 +689,7 @@ def qpos2kpt(
                 [mj_body_pose(mj_model, mj_data, n) for n in KPT_NAMES]
             )  # (K,4,4)
 
+            # 绘制关键点速度箭头
             for i in range(len(KPT_NAMES)):
                 arrow_handler.update_arrow(
                     i,
@@ -659,9 +700,11 @@ def qpos2kpt(
                     color=cmap(i / len(KPT_NAMES)),
                 )
 
+            # 可视化重力坐标系原点
             mj_data.mocap_pos[0] = gvi2wrd_pose[:3, 3]
             mj_data.mocap_quat[0] = mat2quat(gvi2wrd_pose[:3, :3])  # (wxyz)
 
+            # 可视化脚部接触状态
             if foot_contact_est:
                 body_id_foot_l = mj_model.body("left_ankle_roll_link").id
                 body_id_foot_r = mj_model.body("right_ankle_roll_link").id
@@ -675,6 +718,7 @@ def qpos2kpt(
                     + ~foot_contact[1] * -1
                 )
 
+            # 可视化关键点在重力坐标系下的位置
             sph0 = 7
             for k in range(kpt_gv.shape[0]):
                 mj_data.mocap_pos[sph0 + k] = kpt_gv[k, :3, 3]

@@ -35,6 +35,17 @@ wandb/
 # videos
 *.mp4
 
+# 本地环境/会话产物（g1-tennis-sim）
+.env
+*.log
+.claude/
+CLAUDE.md
+.plan/
+heaptrack/
+*.core
+# 含内网服务器地址/凭据的本地运维文档，不随仓库分发
+docs/server-claude-code-setup.md
+
 # IDE directories
 .idea/
 .vscode/

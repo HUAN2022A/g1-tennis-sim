@@ -164,13 +164,14 @@ class CommandWindow:
     BAR_H = 20
     ROW_H = 52
 
-    def __init__(self, commander: KeyboardCommander, *, width: int = 720, fps: int = 60):
+    def __init__(self, commander: KeyboardCommander, status_shm, *, width: int = 720, fps: int = 60):
         if not pygame.get_init():
             pygame.init()
         if not pygame.font.get_init():
             pygame.font.init()
 
         self.commander = commander
+        self.status_shm = status_shm
         self.fps = fps
         self.width = max(560, width)
         self.M = self.MARGIN
@@ -192,7 +193,7 @@ class CommandWindow:
         # Layout heights
         h = self.M
         h += 48                                    # title
-        h += 20                                    # spacing
+        h += 44                                    # simulation status
         h += 44 + len(self._mode_btns) // 5 * 44   # mode selector row(s)
         h += 28                                    # spacing
         h += len(self._axes) * self.ROW_H + 20     # velocity sliders
@@ -213,6 +214,11 @@ class CommandWindow:
         self._draw_rounded_rect(r, _PANEL, self.PANEL_R)
         pygame.draw.rect(self.screen, _BORDER, r, 1, self.PANEL_R)
         return r
+
+    def _status_text(self) -> str:
+        with self.status_shm.get_lock():
+            raw = bytes(self.status_shm.get_obj())
+        return raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
 
     def _draw_section_header(self, text, x, y):
         surf = self.font_section.render(text.upper(), True, _TEXT_DIM)
@@ -242,6 +248,12 @@ class CommandWindow:
             border_radius=2
         )
         y += 48
+
+        status_rect = self._draw_panel(M, y, pw, 32)
+        status = self._status_text()
+        status_surf = self.font_key.render(status, True, _ACCENT)
+        self.screen.blit(status_surf, (status_rect.x + 14, status_rect.y + 8))
+        y += 44
 
         # -- Mode selector --
         self._draw_section_header("Mode", M, y)
@@ -369,7 +381,7 @@ class CommandWindow:
 # Subprocess GUI worker (module-level so it is picklable on macOS spawn)
 # ---------------------------------------------------------------------------
 
-def _gui_worker(dim_specs, freq, win_w, shm_arr, stop_flag):
+def _gui_worker(dim_specs, freq, win_w, shm_arr, status_shm, stop_flag):
     """Run the keyboard GUI in a child process.
 
     Values are written directly to ``shm_arr`` (multiprocessing.Array)
@@ -385,7 +397,7 @@ def _gui_worker(dim_specs, freq, win_w, shm_arr, stop_flag):
 
     names = [d.name for d in dims]
     commander = KeyboardCommander(dims, freq=freq)
-    window = CommandWindow(commander, width=win_w)
+    window = CommandWindow(commander, status_shm, width=win_w)
 
     try:
         while stop_flag.value == 0:
@@ -428,7 +440,9 @@ class KeyboardCmdPad:
 
         # Shared float array: subprocess writes, main process reads
         self._shm = self._ctx.Array("f", n, lock=True)
+        self._status_shm = self._ctx.Array("B", 256, lock=True)
         self._stop = self._ctx.Value("i", 0)
+        self.set_status("Ready: select a track with keys 2-9")
 
         # Initialize with default values
         with self._shm.get_lock():
@@ -450,7 +464,7 @@ class KeyboardCmdPad:
 
         self._proc = self._ctx.Process(
             target=_gui_worker,
-            args=(dim_specs, freq, window_width, self._shm, self._stop),
+            args=(dim_specs, freq, window_width, self._shm, self._status_shm, self._stop),
             daemon=True,
         )
         self._proc.start()
@@ -472,6 +486,15 @@ class KeyboardCmdPad:
         with self._shm.get_lock():
             buf = np.frombuffer(self._shm.get_obj(), dtype=np.float32).copy()
         return {n: float(buf[i]) for i, n in enumerate(self._names)}
+
+    def set_status(self, text: str) -> None:
+        encoded = text.encode("utf-8")[:255]
+        with self._status_shm.get_lock():
+            buf = self._status_shm.get_obj()
+            for i in range(len(buf)):
+                buf[i] = 0
+            for i, value in enumerate(encoded):
+                buf[i] = value
 
     def close(self):
         self._stop.value = 1
@@ -521,6 +544,7 @@ class DeployKeyboardCMD:
         self._last_cmd = {f"Mode{m}": 0 for m in range(self.num_mode)}
         self._last_cmd["Reset"] = 0
         self.mode = 0
+        self._mode_triggered = False
         self.reset_requested = False
 
     def step_command(self) -> HighCommand:
@@ -528,6 +552,7 @@ class DeployKeyboardCMD:
             key = f"Mode{m}"
             if (self._last_cmd[key], self._cmd_pad.get_command(key)) == (0, 1):
                 self.mode = m
+                self._mode_triggered = True
             self._last_cmd[key] = self._cmd_pad.get_command(key)
 
         if (self._last_cmd["Reset"], self._cmd_pad.get_command("Reset")) == (0, 1):
@@ -547,6 +572,15 @@ class DeployKeyboardCMD:
             self.reset_requested = False
             return True
         return False
+
+    def consume_mode_trigger(self) -> bool:
+        """Return whether a number key was pressed since the last poll."""
+        triggered = self._mode_triggered
+        self._mode_triggered = False
+        return triggered
+
+    def set_status(self, text: str) -> None:
+        self._cmd_pad.set_status(text)
 
     def close(self):
         self._cmd_pad.close()

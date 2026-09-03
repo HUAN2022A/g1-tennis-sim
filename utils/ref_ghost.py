@@ -58,7 +58,11 @@ class RefGhostRenderer:
         """Update reference ``MjData`` via forward kinematics on ``qpos``."""
         nq = self.mj_model.nq
         q = np.asarray(qpos, dtype=np.float64).reshape(-1)
-        self.ref_data.qpos[:nq] = q[:nq]
+        self.ref_data.qpos[:] = 0.0
+        self.ref_data.qpos[:min(nq, len(q))] = q[:min(nq, len(q))]
+        if nq > len(q):
+            # 模型含额外 freejoint（如网球）时保持其四元数为单位
+            self.ref_data.qpos[len(q) + 3:len(q) + 7] = (1, 0, 0, 0)
         self.ref_data.qvel[:] = 0.0
         mujoco.mj_forward(self.mj_model, self.ref_data)
 

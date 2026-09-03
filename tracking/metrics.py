@@ -66,8 +66,9 @@ def calculate_kpt_mae_error(state, ref_curr, ref_next, mj_model):
 def calculate_joint_tracking_error(state, ref_curr):
     """Calculate joint position and velocity tracking errors."""
     # Get current joint positions and velocities
-    curr_qpos = state.mj_data.qpos[7:]  # Skip base position/orientation
-    curr_qvel = state.mj_data.qvel[6:]  # Skip base velocity
+    # （网球场景 qpos/qvel 尾部含网球 freejoint，机器人关节固定为前 29 维）
+    curr_qpos = state.mj_data.qpos[7:36]  # Skip base position/orientation
+    curr_qvel = state.mj_data.qvel[6:35]  # Skip base velocity
     
     # Get reference joint positions and velocities
     ref_qpos = ref_curr["qpos"][0, 7:]

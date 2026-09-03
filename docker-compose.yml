@@ -1,0 +1,60 @@
+name: humanoid-gpt
+
+services:
+  inference:
+    image: humanoid-gpt:latest
+    build: .
+    volumes:
+      - ./storage:/workspace/Humanoid-GPT/storage
+    working_dir: /workspace/Humanoid-GPT
+    # GPU acceleration (MJX parallel eval / CUDA ONNX runtime)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Track a folder of motions (headless, no rendering)
+    command: >
+      python3 -m scripts.inference
+      --onnx_track storage/ckpts/pns_wo_priv264.onnx
+      --track_dir storage/test
+      --headless
+
+  # Parallel batch evaluation over a folder of trajectories
+  eval:
+    image: humanoid-gpt:latest
+    build: .
+    volumes:
+      - ./storage:/workspace/Humanoid-GPT/storage
+    working_dir: /workspace/Humanoid-GPT
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      python3 -m scripts.eval_parallel
+      --onnx_track storage/ckpts/pns_wo_priv264.onnx
+      --track_dir storage/test
+      --workers 32
+      --privileged
+
+  # Interactive shell for arbitrary commands
+  shell:
+    image: humanoid-gpt:latest
+    build: .
+    volumes:
+      - ./storage:/workspace/Humanoid-GPT/storage
+    working_dir: /workspace/Humanoid-GPT
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: sleep infinity
