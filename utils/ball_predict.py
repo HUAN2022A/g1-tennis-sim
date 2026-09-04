@@ -1,0 +1,74 @@
+"""网球弹道预测：重力 + 可选空气阻力（V0 不含地面反弹，只在下降段拦截）。
+
+模型（与 docs/TENNIS_STATE_MACHINE_PLAN.md 第 3 节一致）：
+    f_air = -k * m * v * |v|   (k 为单位质量的阻力系数, 1/m)
+
+无解析解（有阻力时），用小步长前向积分 + 二分求交点。
+V0 使用无噪声真值球观测，速度可直接从仿真读出。
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+G = 9.81
+
+
+def _accel(vel: np.ndarray, k: float) -> np.ndarray:
+    """重力 + 阻力加速度。vel: (3,) 世界系速度。"""
+    speed = np.linalg.norm(vel)
+    a = np.zeros(3)
+    a[2] = -G
+    if k > 0 and speed > 1e-9:
+        a -= k * speed * vel
+    return a
+
+
+def predict_ball_trajectory(pos: np.ndarray, vel: np.ndarray, k: float = 0.0,
+                            dt: float = 0.002, horizon: float = 3.0
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """前向积分弹道。返回 (positions (T,3), times (T,))，含 t=0 起点。
+
+    Args:
+        pos/vel: 当前球位置/速度（世界系）
+        k: 空气阻力系数（0 = 纯抛体）
+        dt: 积分步长（半隐式欧拉）
+        horizon: 预测时长
+    """
+    n = int(horizon / dt) + 1
+    out_pos = np.zeros((n, 3))
+    out_t = np.arange(n) * dt
+    p = np.asarray(pos, dtype=np.float64).copy()
+    v = np.asarray(vel, dtype=np.float64).copy()
+    out_pos[0] = p
+    for i in range(1, n):
+        a = _accel(v, k)
+        v = v + a * dt
+        p = p + v * dt
+        out_pos[i] = p
+    return out_pos, out_t
+
+
+def predict_intercept(pos: np.ndarray, vel: np.ndarray, z_plane: float,
+                      k: float = 0.0, require_descending: bool = True
+                      ) -> tuple[np.ndarray, float] | tuple[None, None]:
+    """预测球到达高度 z_plane（击球高度平面）的位置与时刻。
+
+    在"下降段"拦截（plan 第 6 节风险对策：只在弹跳前拦截），默认要求
+    vz < 0 才算有效拦截点。
+
+    Returns:
+        (intercept_pos (3,), t_arrive) 或 (None, None) 表示预测不可达/不满足条件。
+    """
+    out_pos, out_t = predict_ball_trajectory(pos, vel, k=k)
+    for i in range(1, len(out_t)):
+        z_prev, z_curr = out_pos[i - 1][2], out_pos[i][2]
+        if z_prev >= z_plane > z_curr:
+            # 线性插值交点
+            frac = (z_prev - z_plane) / max(z_prev - z_curr, 1e-12)
+            t_arrive = out_t[i - 1] + frac * (out_t[i] - out_t[i - 1])
+            p = out_pos[i - 1] + frac * (out_pos[i] - out_pos[i - 1])
+            if require_descending:
+                return np.asarray(p), float(t_arrive)
+            return np.asarray(p), float(t_arrive)
+    return None, None
