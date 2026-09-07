@@ -16,6 +16,8 @@ from collections import deque
 
 import numpy as np
 
+from utils.ball_predict import fit_ball_state
+
 
 class BallObserver:
     """球状态观测器：真值进、带噪观测出。
@@ -83,3 +85,32 @@ class BallObserver:
             tc = t - t.mean()
             vel = (tc[:, None] * (P - P.mean(axis=0))).sum(axis=0) / (tc ** 2).sum()
         return seg[-1][1].copy(), vel
+
+    def read_fit(self, step: int, ctrl_dt: float, k: float = 0.0,
+                 min_points: int = 8, max_points: int = 16,
+                 compensate_delay: bool = False
+                 ) -> tuple[np.ndarray, np.ndarray] | None:
+        """模型约束读取：对可用观测做弹道(+阻力)拟合，返回 (位置, 速度)。
+
+        与 read() 的区别：速度不用 4 帧 LSQ 斜率，而是对最近 max_points 个
+        观测位置拟合弹道(+阻力)模型（utils.ball_predict.fit_ball_state），
+        模型约束压制速度噪声并处理阻力减速；状态评估于最新可用观测时刻
+        （含 delay_frames 滞后，消除 LSQ 的中点滞后）。
+
+        Args:
+            k: 拟合用阻力系数（与预测器一致，通常传 pred_drag_k）。
+            min_points: 决策所需最少可用观测数（拟合需 >= 4 点）。
+            max_points: 拟合所用最大观测点数（限制旧观测的滞后污染）。
+            compensate_delay: True 时把状态前向外推到当前时刻 step
+                （会重新放大速度噪声，默认关）。
+        """
+        cutoff = step - self.delay_frames
+        avail = [(s, p) for s, p in self._hist if s <= cutoff]
+        if len(avail) < max(4, min_points):
+            return None
+        seg = avail[-max_points:]
+        t = np.asarray([s for s, _ in seg], dtype=np.float64) * ctrl_dt
+        P = np.asarray([p for _, p in seg], dtype=np.float64)
+        t_eval = step * ctrl_dt if compensate_delay else None
+        pos, vel = fit_ball_state(t, P, k=k, t_eval=t_eval)
+        return pos, vel

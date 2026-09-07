@@ -14,10 +14,7 @@
     SWING --片段跟踪完毕--> 结束本球
 - MISS 判定：拦截点与 P_swing 偏差 > 0.15 m 时不挥拍（NO_SWING）。
 
-onset 自动判据（可复现，V2 换片段直接复用）：
-    从峰值帧向前扫描，第一个 site 速度 < ONSET_THR (2.0 m/s) 的帧的下一帧
-    即为挥拍 onset——即峰值前最后一个"慢速帧"之后（球拍开始加速前）。
-    判据依据记录在标定输出中。
+片段加载/复位/标定已抽取到 utils.tennis_clips，发球到 utils.tennis_ball。
 
 用法：
     # 20 球评估（默认）
@@ -42,12 +39,9 @@ import mujoco
 from jax import tree_util as jtu
 
 from tracking import constants as consts
-from tracking.convert_qpos2kpt import qpos2kpt
 from tracking.infer_utils import (
-    G1TrackMjSim,
     G1TrackInferFn,
     g1_infer_env_config,
-    apply_ema_qpos,
 )
 from tracking.policy import Args as PolicyArgs, get_policy_onnx
 from utils.tennis_common import (
@@ -58,14 +52,11 @@ from utils.tennis_common import (
     contact_event,
 )
 from utils.ball_predict import predict_intercept
+from utils.tennis_clips import load_segment, reset_to_frame, calibrate
+from utils.tennis_ball import design_serve
 
 # 状态机状态
 IDLE, TRACK, ARM, SWING = "IDLE", "TRACK", "ARM", "SWING"
-
-# onset 判据阈值：site 速度低于此值视为"慢速帧"（拍面尚未进入挥拍加速段）。
-# 依据 #6 Phase A 数据：Random_001 准备/预摆段 site 速度 0.7-2.4 m/s，
-# 挥拍加速段 148 帧后从 1.4 → 14.3 m/s 单调上升，2.0 m/s 是干净的分界。
-ONSET_SPEED_THR = 2.0
 
 
 @dataclass
@@ -102,172 +93,6 @@ class V0Args:
 
 
 # ---------------------------------------------------------------------------
-# 参考片段加载（与 tennis_hit_test.py load_traj 相同参数）
-# ---------------------------------------------------------------------------
-
-def load_segment(args: V0Args) -> dict:
-    raw = dict(np.load(args.track, allow_pickle=True))
-    if "qpos" not in raw and {"root_pos", "root_rot", "dof_pos"} <= raw.keys():
-        raw["qpos"] = np.concatenate(
-            [raw["root_pos"], raw["root_rot"], raw["dof_pos"]], axis=1
-        )
-    if "qpos" not in raw:
-        raise ValueError(f"{args.track} missing qpos field")
-    raw["qpos"] = apply_ema_qpos(raw["qpos"])
-    freq_src = float(raw.get("frequency", 50))
-    return qpos2kpt(
-        mujoco.MjModel.from_xml_path(args.convert_xml_path),
-        np.float32(raw["qpos"]),
-        freq_src=freq_src, freq_tgt=args.freq,
-        interp_sec=0.0, end_default_sec=0.0,
-        debug=False, foot_contact_est=False,
-        height_clip_mode=None, video_path=None,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 仿真复位与站桩起步回放
-# ---------------------------------------------------------------------------
-
-def reset_to_frame(sim: G1TrackMjSim, infer_fn, ref_traj: dict, frame: int,
-                   ball_adr: int, ball_dof: int, zero_root_vel: bool = False):
-    """把机器人复位到参考片段第 frame 帧的位姿（含根部 xy，站桩位），
-    球挪到远处待命。返回 state。
-
-    zero_root_vel=True 时把根部速度清零——站桩起步需要静止的机器人；
-    参考 onset 帧的根部速度 ~1.6 m/s（挥拍前重心已在移动），不清零会导致
-    站桩保持期间机器人前冲 ~0.75 m。
-    """
-    state = sim.init_state()
-    sim.init_qpos[:36] = ref_traj["qpos"][frame].copy()
-    state = sim.reset(state)
-    if zero_root_vel:
-        state.mj_data.qvel[:] = 0.0
-    mujoco.mj_forward(sim.mj_model, state.mj_data)
-    set_ball(state.mj_data, ball_adr, ball_dof, (100.0, 100.0, 5.0))
-    infer_fn.info["last_action"][:] = 0
-    infer_fn.info["step"] = 0
-    return state
-
-
-def hold_and_replay(sim: G1TrackMjSim, infer_fn, ref_traj: dict, site_id: int,
-                    onset: int, end_frame: int, hold_frames: int,
-                    ball_adr: int, ball_dof: int) -> np.ndarray:
-    """站桩保持 hold_frames 帧后，从 onset 帧跟踪到 end_frame，记录 site 轨迹。
-
-    标定与在线 SWING 使用同一序列，保证标定的 P_swing 是在线可达的。
-    """
-    state = reset_to_frame(sim, infer_fn, ref_traj, onset, ball_adr, ball_dof,
-                           zero_root_vel=True)
-    ref_hold = jtu.tree_map(lambda x: x[onset][None], ref_traj)
-    for _ in range(hold_frames):
-        motor = infer_fn.infer_onnx(
-            state, {"ref_curr": ref_hold, "ref_next": ref_hold})
-        state = sim.step(state, motor)
-
-    site_traj = []
-    for f in range(onset, end_frame + 1):
-        ref_curr = jtu.tree_map(lambda x: x[f][None], ref_traj)
-        nxt = min(f + 1, len(ref_traj["qpos"]) - 1)
-        ref_next = jtu.tree_map(lambda x: x[nxt][None], ref_traj)
-        motor = infer_fn.infer_onnx(state, {"ref_curr": ref_curr, "ref_next": ref_next})
-        state = sim.step(state, motor)
-        site_traj.append(site_state(sim.mj_model, state.mj_data, site_id)[0])
-    return np.asarray(site_traj)
-
-
-# ---------------------------------------------------------------------------
-# 离线标定：onset（自动判据）→ T_lead / P_swing（站桩起步回放）
-# ---------------------------------------------------------------------------
-
-def detect_onset(speeds: np.ndarray, peak: int,
-                 thr: float = ONSET_SPEED_THR) -> int:
-    """从峰值帧向前扫描，第一个速度 < thr 的帧的下一帧 = 挥拍 onset。
-
-    依据：挥拍加速段速度单调上升，其前方最近的慢速帧是预摆停顿点；
-    onset 取该慢速帧 +1（球拍开始加速的第一帧）。
-    """
-    for f in range(peak - 1, -1, -1):
-        if speeds[f] < thr:
-            return f + 1
-    return 0
-
-
-def calibrate(sim: G1TrackMjSim, infer_fn, ref_traj: dict, site_id: int,
-              ball_adr: int, ball_dof: int, ctrl_dt: float,
-              max_steps: int, hold_frames: int,
-              onset_thr: float = ONSET_SPEED_THR) -> dict:
-    """标定挥拍段参数。返回 dict（含 onset 判据记录）。
-
-    步骤：
-    1. Phase A 全轨迹无球回放 → site 速度 → 峰值帧 peak、onset（自动判据）。
-    2. 站桩起步回放（hold @ onset → 跟踪 onset..peak+30）→ site 轨迹
-       → 局部峰值帧 p_local、P_swing、T_lead = p_local * ctrl_dt。
-       （跟踪从 onset 开始，故 T_lead = onset→峰值时长。）
-    """
-    traj_len = len(ref_traj["qpos"])
-    n_steps = min(traj_len, max_steps) if max_steps > 0 else traj_len
-
-    # --- 步骤 1：Phase A 全轨迹回放（球在远处，根部速度按参考） ---
-    state = reset_to_frame(sim, infer_fn, ref_traj, 0, ball_adr, ball_dof,
-                           zero_root_vel=False)
-    speeds = []
-    for f in range(n_steps):
-        ref_curr = jtu.tree_map(lambda x: x[f][None], ref_traj)
-        nxt = min(f + 1, traj_len - 1)
-        ref_next = jtu.tree_map(lambda x: x[nxt][None], ref_traj)
-        motor = infer_fn.infer_onnx(state, {"ref_curr": ref_curr, "ref_next": ref_next})
-        state = sim.step(state, motor)
-        _, _, svel = site_state(sim.mj_model, state.mj_data, site_id)
-        speeds.append(np.linalg.norm(svel))
-    speeds = np.asarray(speeds)
-    peak = int(np.argmax(speeds))
-    onset = detect_onset(speeds, peak, thr=onset_thr)
-
-    # --- 步骤 2：站桩起步回放 ---
-    end_frame = min(peak + 30, traj_len - 1)
-    site_traj = hold_and_replay(sim, infer_fn, ref_traj, site_id,
-                                onset, end_frame, hold_frames, ball_adr, ball_dof)
-    # 局部峰值（site_traj 索引 = 片段帧号 - onset）
-    v = np.linalg.norm(np.diff(site_traj, axis=0), axis=1) / ctrl_dt
-    p_local = int(np.argmax(v)) + 1
-    p_swing = site_traj[p_local]
-    t_lead = p_local * ctrl_dt
-
-    return {
-        "t_lead": float(t_lead),
-        "p_swing": p_swing,
-        "onset": int(onset),
-        "peak": int(peak),
-        "peak_speed": float(speeds[peak]),
-        "onset_thr": float(onset_thr),
-        "onset_speed_before": float(speeds[onset - 1]) if onset > 0 else 0.0,
-        "hold_frames": int(hold_frames),
-        "site_traj_swing": site_traj,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 发射器（固定模式，弹道按标定结果自动设计）
-# ---------------------------------------------------------------------------
-
-def design_serve(p_swing: np.ndarray, flight_time: float,
-                 serve_pos: tuple = ()) -> tuple[np.ndarray, np.ndarray]:
-    """设计发射位置/速度：抛体解使球在 flight_time 后到达 P_swing。
-
-    默认发射点在 P_swing 上游 +x 侧（场地对面方向），高度 +1m。
-    v = (P - p0 + 0.5*g*T^2*e_z) / T
-    """
-    if serve_pos:
-        p0 = np.asarray(serve_pos, dtype=np.float64)
-    else:
-        p0 = p_swing + np.array([2.8, 0.0, 1.0])
-    T = flight_time
-    v = (p_swing - p0 + np.array([0.0, 0.0, 0.5 * 9.81 * T * T])) / T
-    return p0, v
-
-
-# ---------------------------------------------------------------------------
 # V0 评估主循环
 # ---------------------------------------------------------------------------
 
@@ -277,7 +102,7 @@ def run_v0(args: V0Args):
     policy = get_policy_onnx(PolicyArgs(onnx_track=args.onnx_track))
 
     print(f"[V0] Loading segment: {args.track}")
-    ref_traj = load_segment(args)
+    ref_traj = load_segment(args.track, args.convert_xml_path, args.freq)
     traj_len = len(ref_traj["qpos"])
     print(f"[V0] Segment length: {traj_len} frames ({traj_len * ctrl_dt:.1f} s)")
 
