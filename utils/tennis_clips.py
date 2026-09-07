@@ -46,16 +46,23 @@ def load_segment(path: str, convert_xml_path: str, freq: int) -> dict:
 
 
 def reset_to_frame(sim: G1TrackMjSim, infer_fn, ref_traj: dict, frame: int,
-                   ball_adr: int, ball_dof: int, zero_root_vel: bool = False):
+                   ball_adr: int, ball_dof: int, zero_root_vel: bool = False,
+                   root_xy_offset: tuple = (0.0, 0.0)):
     """把机器人复位到参考片段第 frame 帧的位姿（含根部 xy，站桩位），
     球挪到远处待命。返回 state。
 
     zero_root_vel=True 时把根部速度清零——站桩起步需要静止的机器人；
     参考 onset 帧的根部速度 ~1.6 m/s（挥拍前重心已在移动），不清零会导致
     站桩保持期间机器人前冲 ~0.75 m。
+
+    root_xy_offset：在 onset 帧根部 xy 上叠加平移（V3 走到拦截点后
+    把挥拍重定向到实际拦截点用），默认 (0,0) 不变。
     """
     state = sim.init_state()
     sim.init_qpos[:36] = ref_traj["qpos"][frame].copy()
+    if root_xy_offset[0] != 0.0 or root_xy_offset[1] != 0.0:
+        sim.init_qpos[0] += root_xy_offset[0]
+        sim.init_qpos[1] += root_xy_offset[1]
     state = sim.reset(state)
     if zero_root_vel:
         state.mj_data.qvel[:] = 0.0
