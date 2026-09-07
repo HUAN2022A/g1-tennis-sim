@@ -47,9 +47,10 @@ def load_segment(path: str, convert_xml_path: str, freq: int) -> dict:
 
 def reset_to_frame(sim: G1TrackMjSim, infer_fn, ref_traj: dict, frame: int,
                    ball_adr: int, ball_dof: int, zero_root_vel: bool = False,
-                   root_xy_offset: tuple = (0.0, 0.0)):
-    """把机器人复位到参考片段第 frame 帧的位姿（含根部 xy，站桩位），
-    球挪到远处待命。返回 state。
+                   root_xy_offset: tuple = (0.0, 0.0),
+                   ball_state: tuple | None = None):
+    """把机器人复位到参考片段第 frame 帧的位姿（含根部 xy，站桩位）。
+    返回 state。
 
     zero_root_vel=True 时把根部速度清零——站桩起步需要静止的机器人；
     参考 onset 帧的根部速度 ~1.6 m/s（挥拍前重心已在移动），不清零会导致
@@ -57,6 +58,10 @@ def reset_to_frame(sim: G1TrackMjSim, infer_fn, ref_traj: dict, frame: int,
 
     root_xy_offset：在 onset 帧根部 xy 上叠加平移（V3 走到拦截点后
     把挥拍重定向到实际拦截点用），默认 (0,0) 不变。
+
+    ball_state：球的状态 (qpos_7, qvel_6)。默认 None = 把球 park 到远处
+    待命（发射前复位用）；传入时恢复球（V3 到达时中途重定向挥拍，需保留
+    飞行中的球，否则 reset 会把球 freejoint 重置、破坏飞行状态）。
     """
     state = sim.init_state()
     sim.init_qpos[:36] = ref_traj["qpos"][frame].copy()
@@ -66,8 +71,12 @@ def reset_to_frame(sim: G1TrackMjSim, infer_fn, ref_traj: dict, frame: int,
     state = sim.reset(state)
     if zero_root_vel:
         state.mj_data.qvel[:] = 0.0
+    if ball_state is None:
+        set_ball(state.mj_data, ball_adr, ball_dof, (100.0, 100.0, 5.0))
+    else:
+        state.mj_data.qpos[ball_adr:ball_adr + 7] = ball_state[0]
+        state.mj_data.qvel[ball_dof:ball_dof + 6] = ball_state[1]
     mujoco.mj_forward(sim.mj_model, state.mj_data)
-    set_ball(state.mj_data, ball_adr, ball_dof, (100.0, 100.0, 5.0))
     infer_fn.info["last_action"][:] = 0
     infer_fn.info["step"] = 0
     return state
@@ -244,3 +253,21 @@ def select_clip(inter_p: np.ndarray, body_y: float, clips: list[ClipSpec],
         if clip.side == side:
             return clip
     return None
+
+
+def shift_ref_root(ref_traj: dict, offset: tuple) -> dict:
+    """平移参考轨迹的根 xy（世界系），用于 V3 重定向挥拍到新拦截点。
+
+    offset 是世界系 (dx, dy)。改 qpos 根位置 + gv2wrd_pose 的平移分量；
+    其余字段（kpt2gv_pose / kpt_cvel_in_gv / gv_vel / foot_contact 等）是
+    根相对量或根速度，不随根的常平移变化。返回数组深拷贝，不改动原 ref_traj。
+    """
+    shifted = {k: v for k, v in ref_traj.items()}
+    shifted["qpos"] = ref_traj["qpos"].copy()
+    shifted["qpos"][:, 0] += offset[0]
+    shifted["qpos"][:, 1] += offset[1]
+    # gv2wrd_pose (T,4,4)：平移分量 [:3,3] = [root_x, root_y, 0]（地面投影）
+    shifted["gv2wrd_pose"] = ref_traj["gv2wrd_pose"].copy()
+    shifted["gv2wrd_pose"][:, 0, 3] += offset[0]
+    shifted["gv2wrd_pose"][:, 1, 3] += offset[1]
+    return shifted
