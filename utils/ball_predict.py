@@ -99,17 +99,24 @@ def _sample_positions(pos: np.ndarray, vel: np.ndarray, k: float,
 
 
 def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
-                   t_eval: float | None = None) -> tuple[np.ndarray, np.ndarray, float]:
+                   t_eval: float | None = None,
+                   refine_k: bool = True) -> tuple[np.ndarray, np.ndarray, float]:
     """对含噪观测位置做弹道(+阻力)拟合，返回 (pos, vel, k_est) 于 t_eval 时刻。
 
     Args:
         t_obs: (N,) 绝对时间（秒）；p_obs: (N,3) 观测位置；k: 阻力系数先验。
         t_eval: 求值时刻（秒），默认最新观测 t_obs[-1]。
+        refine_k: True（默认）= Gauss-Newton 联合细化 7 参数 (p0, v0, k)，
+            返回在线估计的 k_est；False = 固定入参 k，只细化 6 参数
+            (p0, v0)（与 6a1f3d5 原版算法逐行等价），k_est == 入参 k。
 
-    先用 k=0 闭式二次拟合初始化 (p0, v0)；k>0 时用 Gauss-Newton 同时细化
-    (p0, v0, k)（前向模型复用 predict_ball_trajectory，7 参数有限差分雅可比）。
-    返回的 k_est 是观测窗内辨识出的真实阻力系数——长滞空下阻力失配会放大成
-    拦截点预测偏差，固定先验 k 无法适应域随机化的真实 k，必须在线估计。
+    先用 k=0 闭式二次拟合初始化 (p0, v0)；refine_k=True 且 k>0 时用
+    Gauss-Newton 同时细化 (p0, v0, k)（前向模型复用 predict_ball_trajectory，
+    7 参数有限差分雅可比）。返回的 k_est 是观测窗内辨识出的真实阻力系数——
+    长滞空下阻力失配会放大成拦截点预测偏差，固定先验 k 无法适应域随机化的
+    真实 k，必须在线估计。refine_k=False 用于短观测窗 + 高噪声场景（如 V1
+    的 σ=5mm + ≤16 帧窗）：此时 7 参数联合拟合病态（v0 吸收阻力误差，
+    末段按 k_est 积分进一步污染状态），改用固定先验 k 拟合与积分。
     """
     t_obs = np.asarray(t_obs, dtype=np.float64).reshape(-1)
     p_obs = np.asarray(p_obs, dtype=np.float64)
@@ -127,9 +134,10 @@ def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
     p0 = coef[0].copy()
     v0 = coef[1].copy()
 
-    # 2) k>0 Gauss-Newton 细化 (p0, v0, k)
+    # 2) k>0 Gauss-Newton 细化
     k_est = float(k)
-    if k > 0:
+    if k > 0 and refine_k:
+        # 联合细化 (p0, v0, k) 7 参数
         pred = _sample_positions(p0, v0, k_est, t_rel)
         for _ in range(6):
             resid = (pred - p_obs).ravel()
@@ -148,6 +156,28 @@ def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
             k_est = float(np.clip(k_est + delta[6], 0.0, 0.05))
             pred = _sample_positions(p0, v0, k_est, t_rel)
             if np.linalg.norm(delta) < 1e-7:
+                break
+    elif k > 0:
+        # 固定 k，只细化 (p0, v0) 6 参数——与 6a1f3d5 原版逐行等价
+        # （迭代次数 3 / eps 1e-6 / 正则 1e-9 / 收敛阈值 1e-6 全部照旧，
+        # 位级复现关键，勿改）
+        pred = _sample_positions(p0, v0, k, t_rel)
+        for _ in range(3):
+            resid = (pred - p_obs).ravel()
+            base = np.concatenate([p0, v0])
+            eps = 1e-6
+            J = np.empty((3 * n, 6))
+            for j in range(6):
+                pert = base.copy()
+                pert[j] += eps
+                pred_p = _sample_positions(pert[:3], pert[3:], k, t_rel)
+                J[:, j] = (pred_p - pred).ravel() / eps
+            delta, *_ = np.linalg.lstsq(J.T @ J + 1e-9 * np.eye(6),
+                                       -J.T @ resid, rcond=None)
+            p0 = p0 + delta[:3]
+            v0 = v0 + delta[3:]
+            pred = _sample_positions(p0, v0, k, t_rel)
+            if np.linalg.norm(delta) < 1e-6:
                 break
 
     # 3) 评估到 t_eval

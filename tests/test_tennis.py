@@ -34,6 +34,33 @@ def test_fit_ball_state_reduces_velocity_error():
     assert err_fit < err_lsq, f"fit {err_fit:.4f} should beat LSQ {err_lsq:.4f}"
 
 
+def test_fit_ball_state_fixed_k_keeps_k_and_beats_lsq():
+    """refine_k=False：固定 k 6 参数拟合——k_est 恒等于入参 k，速度仍优于 4 帧 LSQ。"""
+    rng = np.random.default_rng(0)
+    k = 0.0125
+    p0 = np.array([0.0, 0.0, 3.0])
+    v0 = np.array([3.0, 0.5, 2.0])
+    dt = 0.02
+    N = 16
+    traj, ts = predict_ball_trajectory(p0, v0, k=k, dt=0.002, horizon=(N - 1) * dt + 0.01)
+    t_obs = np.arange(N) * dt
+    P_true = np.array([[np.interp(t, ts, traj[:, a]) for a in range(3)] for t in t_obs])
+    P_obs = P_true + rng.uniform(-0.005, 0.005, size=P_true.shape)
+    _, v_fit, k_est = fit_ball_state(t_obs, P_obs, k=k, refine_k=False)
+    # 固定 k 路径不在线估计阻力：k_est 恒等于入参 k
+    assert k_est == k, f"k_est {k_est} should equal input k {k}"
+    _, v_end = _integrate_state(p0, v0, k, 0.002, (N - 1) * dt)
+    # 4 帧 LSQ 斜率基线（速度在窗口中点，含阻力减速失配）
+    t4 = t_obs[-4:]
+    P4 = P_obs[-4:]
+    tc = t4 - t4.mean()
+    v_lsq = (tc[:, None] * (P4 - P4.mean(axis=0))).sum(axis=0) / (tc ** 2).sum()
+    _, v_mid = _integrate_state(p0, v0, k, 0.002, (t4[0] + t4[-1]) / 2)
+    err_fit = np.linalg.norm(v_fit - v_end)
+    err_lsq = np.linalg.norm(v_lsq - v_mid)
+    assert err_fit < err_lsq, f"fixed-k fit {err_fit:.4f} should beat LSQ {err_lsq:.4f}"
+
+
 def test_fit_ball_state_k0_exact():
     p0 = np.array([0.0, 0.0, 1.0])
     v0 = np.array([1.0, 0.0, 0.0])

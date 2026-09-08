@@ -88,7 +88,8 @@ class BallObserver:
 
     def read_fit(self, step: int, ctrl_dt: float, k: float = 0.0,
                  min_points: int = 8, max_points: int = 16,
-                 compensate_delay: bool = False
+                 compensate_delay: bool = False,
+                 refine_k: bool = True
                  ) -> tuple[np.ndarray, np.ndarray] | None:
         """模型约束读取：对可用观测做弹道(+阻力)拟合，返回 (位置, 速度)。
 
@@ -103,6 +104,11 @@ class BallObserver:
             max_points: 拟合所用最大观测点数（限制旧观测的滞后污染）。
             compensate_delay: True 时把状态前向外推到当前时刻 step
                 （会重新放大速度噪声，默认关）。
+            refine_k: 透传给 fit_ball_state。True（默认）= 在线估计阻力
+                k（7 参数联合拟合，返回的 k_est 异于入参 k）；False = 固定
+                入参 k 拟合（6 参数，k_est == k），用于短观测窗 + 高噪声
+                场景（V1：σ=5mm + ≤16 帧窗下 7 参数联合拟合病态，污染
+                返回的 (位置, 速度)）。
         """
         cutoff = step - self.delay_frames
         avail = [(s, p) for s, p in self._hist if s <= cutoff]
@@ -112,5 +118,6 @@ class BallObserver:
         t = np.asarray([s for s, _ in seg], dtype=np.float64) * ctrl_dt
         P = np.asarray([p for _, p in seg], dtype=np.float64)
         t_eval = step * ctrl_dt if compensate_delay else None
-        pos, vel, k_est = fit_ball_state(t, P, k=k, t_eval=t_eval)
+        pos, vel, k_est = fit_ball_state(t, P, k=k, t_eval=t_eval,
+                                         refine_k=refine_k)
         return pos, vel, k_est

@@ -223,11 +223,22 @@ def run_v1_pass(args: V1Args, sim, infer_fn, ref_traj, cal: dict,
                     # 会造成假 NO_SWING / 假触发）
                     obs = observer.read_fit(ep_step, ctrl_dt,
                                             k=args.pred_drag_k,
-                                            min_points=args.obs_window)
+                                            min_points=args.obs_window,
+                                            refine_k=False)
                     if obs is not None:
-                        opos, ovel, k_est = obs
+                        opos, ovel, _k_est = obs
+                        # V1 走固定 k 路径（refine_k=False）：b3e0f99 的
+                        # fit_ball_state 7 参数 (p0,v0,k) 联合拟合在 σ=5mm
+                        # 噪声 + 5% dropout + 短观测窗（≤16 帧）下病态——
+                        # 病态 k_est 不只影响预测，还会污染拟合出的
+                        # (pos, vel) 本身（v0 吸收阻力误差、末段按 k_est
+                        # 积分），只把预测侧 k 改回固定仍残留回归（26%）。
+                        # 因此拟合与预测都用固定无偏中点 k=pred_drag_k
+                        # （0.0125），等价 09-07（6a1f3d5）固定 k 算法；
+                        # k_est 仅 V3 长滞空多观测帧场景有益（V3 保持默认
+                        # refine_k=True 在线估计），V1 不用于拟合与预测。
                         inter_p, t_arr = predict_intercept(
-                            opos, ovel, z_plane=z_plane, k=k_est)
+                            opos, ovel, z_plane=z_plane, k=args.pred_drag_k)
                         if inter_p is not None:
                             dev_now = np.linalg.norm(inter_p - p_swing)
                             # NO_SWING 判据要稳健：预测需已收敛（剩余时间
