@@ -20,8 +20,15 @@ from tracking import constants as consts
 
 TENNIS_SCENE_XML = consts.ROOT_PATH / "scene_tennis.xml"
 
-# 拍面法向从腕部坐标系 z 轴转 90°（圆柱默认沿 z，转后拍面法向为 y）
-_RACKET_FACE_QUAT = (0.7071068, 0.0, 0.7071068, 0.0)
+# 拍面法向沿腕部坐标系 z 轴（圆柱默认沿 z，无需旋转，quat=identity），
+# 拍面平面由拍柄方向 x 与腕部 y 张成。
+# V0 起这里是 (0.7071,0,0.7071,0)（绕 y 转 90°，法向落到拍柄方向 x，
+# 拍面平面⊥拍柄，注释却写"转后法向为 y"）——2026-09-08 修正。
+# 法向选 z 是 2026-09-08 实测选定（logs/racketfix_candidates.log，
+# 8 球干净快测）：候选 ±y/±z 四种里 ±z 命中 3/8 且接触面内半径
+# 0.098-0.143（拍面中部）；±y 仅 1/8 且接触在框缘 r≈0.175；
+# 旧 ±x 2/8、接触贴外缘带 r≈0.15。圆柱轴向翻转对称，±z 物理等价。
+_RACKET_FACE_QUAT = (1.0, 0.0, 0.0, 0.0)
 
 
 def attach_racket(spec: mujoco.MjSpec, mass: float = 0.3) -> None:
@@ -36,23 +43,28 @@ def attach_racket(spec: mujoco.MjSpec, mass: float = 0.3) -> None:
     )
     grip.contype = 0
     grip.conaffinity = 0
-    # 拍喉（握把与拍头之间）
+    # 拍喉（握把与拍头之间；终点与拍头环近端 0.28 衔接，收到 0.30 略搭接）
     throat = racket.add_geom(
         name="racket_throat", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-        fromto=[0.18, 0, 0, 0.34, 0, 0], size=[0.009, 0, 0],
+        fromto=[0.18, 0, 0, 0.30, 0, 0], size=[0.009, 0, 0],
         rgba=[0.16, 0.16, 0.19, 1],
     )
     throat.contype = 0
     throat.conaffinity = 0
-    # 拍头椭圆框（细胶囊围成椭圆环，纯视觉）
+    # 拍头椭圆框（细胶囊围成椭圆环，纯视觉）。拍头平面含拍柄轴（x）：
+    # 长轴沿 x（半轴 a=0.17，拍头从 0.28 延伸到 0.62），短轴沿 y（半轴 b），
+    # 法向沿 z——与真实网球拍一致（拍头与拍柄同面延伸），且与碰撞盘
+    # （法向 z）同面。
+    # b 取 0.15：碰撞盘半径 0.17，b=0.15 把"接触点落在画出的弦床之外"的
+    # 边带压到 2 cm（b=0.13 边带 4 cm；圆形拍头 b=0.17 则完全无带）。
     cx = 0.45
-    a, b = 0.17, 0.13  # 半长轴(Z) 半短轴(Y)
+    a, b = 0.17, 0.15  # 半长轴(X) 半短轴(Y)
     n_seg = 14
     for i in range(n_seg):
         t0 = 2 * np.pi * i / n_seg
         t1 = 2 * np.pi * (i + 1) / n_seg
-        p0 = [cx, b * np.sin(t0), a * np.cos(t0)]
-        p1 = [cx, b * np.sin(t1), a * np.cos(t1)]
+        p0 = [cx + a * np.cos(t0), b * np.sin(t0), 0]
+        p1 = [cx + a * np.cos(t1), b * np.sin(t1), 0]
         seg = racket.add_geom(
             name=f"racket_frame_{i}", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
             fromto=[*p0, *p1], size=[0.010, 0, 0],
@@ -60,10 +72,10 @@ def attach_racket(spec: mujoco.MjSpec, mass: float = 0.3) -> None:
         )
         seg.contype = 0
         seg.conaffinity = 0
-    # 拍面弦床（半透明薄盒，纯视觉）
+    # 拍面弦床（半透明薄盒，纯视觉）：平面内 x-y，薄方向 z（=拍面法向）
     bed = racket.add_geom(
         name="racket_strings", type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=[0.012, b * 0.95, a * 0.95], pos=[cx, 0, 0],
+        size=[a * 0.95, b * 0.95, 0.012], pos=[cx, 0, 0],
         rgba=[0.92, 0.92, 0.92, 0.22],
     )
     bed.contype = 0
@@ -77,8 +89,13 @@ def attach_racket(spec: mujoco.MjSpec, mass: float = 0.3) -> None:
     col.condim = 3
     col.friction = [0.5, 0.005, 0.0001]
     col.solref = [0.005, 1]
-    # 拍面中心（用于命中检测/奖励）
-    racket.add_site(name="racket_point", pos=[0.45, 0, 0], size=[0.005, 0.005, 0.005])
+    # 拍面中心（用于命中检测/奖励）。quat 绕 x 转 +90°：使 site 系 y 轴对准
+    # 腕系 z 轴（=拍面法向，见 _RACKET_FACE_QUAT 注释）——这样
+    # utils/tennis_common.py site_state 取 site 系 y 轴做法向的约定严格成立。
+    # 只改朝向，位置不变，命中检测（site_xpos）不受影响。
+    racket.add_site(name="racket_point", pos=[0.45, 0, 0],
+                    quat=[0.7071068, 0.7071068, 0.0, 0.0],
+                    size=[0.005, 0.005, 0.005])
 
     racket.explicitinertial = True
     racket.ipos = [0.35, 0, 0]
