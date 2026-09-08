@@ -28,18 +28,46 @@ def attach_racket(spec: mujoco.MjSpec, mass: float = 0.3) -> None:
     """在 right_wrist_yaw_link 下挂接无关节球拍 body（修改 spec，原地生效）。"""
     wrist = spec.body("right_wrist_yaw_link")
     racket = wrist.add_body(name="racket", pos=[0.05, 0, 0])
-    # 拍柄 + 拍杆
-    racket.add_geom(
-        name="racket_shaft", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-        fromto=[0.08, 0, 0, 0.30, 0, 0], size=[0.012, 0, 0],
-        rgba=[0.15, 0.15, 0.18, 1],
+    # 拍柄（握把）
+    grip = racket.add_geom(
+        name="racket_grip", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+        fromto=[0.03, 0, 0, 0.18, 0, 0], size=[0.016, 0, 0],
+        rgba=[0.13, 0.13, 0.16, 1],
     )
-    # 拍面（视觉）
-    racket.add_geom(
-        name="racket_frame", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-        size=[0.17, 0.012, 0.012], pos=[0.45, 0, 0],
-        quat=list(_RACKET_FACE_QUAT), rgba=[0.15, 0.15, 0.18, 1],
+    grip.contype = 0
+    grip.conaffinity = 0
+    # 拍喉（握把与拍头之间）
+    throat = racket.add_geom(
+        name="racket_throat", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+        fromto=[0.18, 0, 0, 0.34, 0, 0], size=[0.009, 0, 0],
+        rgba=[0.16, 0.16, 0.19, 1],
     )
+    throat.contype = 0
+    throat.conaffinity = 0
+    # 拍头椭圆框（细胶囊围成椭圆环，纯视觉）
+    cx = 0.45
+    a, b = 0.17, 0.13  # 半长轴(Z) 半短轴(Y)
+    n_seg = 14
+    for i in range(n_seg):
+        t0 = 2 * np.pi * i / n_seg
+        t1 = 2 * np.pi * (i + 1) / n_seg
+        p0 = [cx, b * np.sin(t0), a * np.cos(t0)]
+        p1 = [cx, b * np.sin(t1), a * np.cos(t1)]
+        seg = racket.add_geom(
+            name=f"racket_frame_{i}", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+            fromto=[*p0, *p1], size=[0.010, 0, 0],
+            rgba=[0.16, 0.16, 0.19, 1],
+        )
+        seg.contype = 0
+        seg.conaffinity = 0
+    # 拍面弦床（半透明薄盒，纯视觉）
+    bed = racket.add_geom(
+        name="racket_strings", type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=[0.012, b * 0.95, a * 0.95], pos=[cx, 0, 0],
+        rgba=[0.92, 0.92, 0.92, 0.22],
+    )
+    bed.contype = 0
+    bed.conaffinity = 0
     # 拍面（碰撞代理：薄圆柱）
     col = racket.add_geom(
         name="racket_collision", type=mujoco.mjtGeom.mjGEOM_CYLINDER,

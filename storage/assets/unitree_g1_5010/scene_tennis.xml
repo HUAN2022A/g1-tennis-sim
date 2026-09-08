@@ -45,8 +45,8 @@
                   contype="1" conaffinity="1"/>
         </body>
 
-        <!-- 球网：沿 y 轴，位于 x=0；总长 12.8 m（半场宽 11.885 m + 两侧外扩），中心高 0.914 m -->
-        <body name="net" pos="0 0 0">
+        <!-- 球网：沿 y 轴，位于 x=3（机器人前方，球从 x=4.8 侧过网而来）；总长 12.8 m，中心高 0.914 m -->
+        <body name="net" pos="3 0 0">
             <!-- 网带（顶沿） -->
             <geom name="net_band" type="box" size="0.02 6.4 0.02" pos="0 0 0.914"
                   material="net_white" contype="0" conaffinity="0"/>
