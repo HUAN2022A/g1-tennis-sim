@@ -100,6 +100,23 @@ class V3Args:
                                        # 重定向→固定站桩 hold_frames→挥拍峰值 正好对准球到达，
                                        # 同时让站桩 hold 时长与标定一致（标定陷阱）。
 
+    # --- 触发时序偏置（单位=控制帧）---
+    # 与 V1 的 trigger_bias_frames 同类旋钮（机理见 tennis_v1_robust.py 注释）：
+    # V3 的"触发"= 重定向门限 t_arr<=redirect_lead。决策帧 k 的拟合状态评估在
+    # 最新可用观测时刻（WALK 段步进前采样 ⇒ 标签 k = 时刻 k·dt，read_fit
+    # cutoff=k-1 ⇒ 状态时刻 =(k-1)dt，比决策帧晚 1 帧）；重定向当拍不步进物理，
+    # 随后固定站桩 hold_frames 帧、挥拍首步物理在 (r+31)dt ⇒ 评估→拍面峰值
+    # 合计 hold+2+peak_local 帧——redirect_lead 的"+2 补偿帧"（0.90s=45f=
+    # 30+13+2）恰好覆盖该 2 帧链路滞后，V3 不复现 V1 的系统性偏晚 −2f。
+    # τ 仪表实测（logs/v3trig_diag.log，隔离 8 球零噪声）：bias=0 时 HIT 球
+    # τ=球过面−拍面峰值 ≈ 0（−0.13~+0.02f），链路代数值 τ_conv −0.45~−0.87f，
+    # 全体均值 −0.80f（残差是逐球 ±1f 的预测-真值差，非链路偏置）；完整
+    # 配置 20 球 τ 均值 +0.05f（噪声主导 ±3f）。逐档实测 bias 每加 −1 平移
+    # τ +1f：隔离 8 球命中 4/8(bias 0) → 1/8(−1) → 0/8(−2)——12m/s 回落速度
+    # 下 1 帧=0.24m 垂直误差远超拍面容差，任何系统平移都净有害。故默认 0；
+    # 旋钮保留供域变化时对心。
+    trigger_bias_frames: int = 0
+
     out_dir: str = "logs/tennis_v3"
 
 
@@ -266,7 +283,11 @@ def run_v3(args: V3Args):
                             root_xy = state.mj_data.qpos[0:2]
                             root_yaw = quat2yaw(state.mj_data.qpos[3:7])
                             dist = float(np.linalg.norm(nav_target - root_xy))
-                            if dist < args.arrive_dist and t_arr <= args.redirect_lead:
+                            # 触发门限加 trigger_bias_frames*ctrl_dt 平移（V1 同款
+                            # 机理旋钮，默认 0=不平移，见 V3Args 注释）
+                            if dist < args.arrive_dist and \
+                                    t_arr + args.trigger_bias_frames * ctrl_dt \
+                                    <= args.redirect_lead:
                                 # 到达且时间充足：重定向挥拍到实际拦截点，进入 TRACK
                                 # （保留飞行中的球：reset 会重置球 freejoint）
                                 ball_qpos = state.mj_data.qpos[ball_adr:ball_adr + 7].copy()
@@ -345,6 +366,20 @@ def run_v3(args: V3Args):
             ep_step += 1
         state.mj_data.qfrc_applied[:] = 0.0
 
+        # τ 仪表（方法同 V1 logs/trigfix_diag.log）：τ = 球过拦截面时刻 −
+        # 拍面峰值时刻（帧）。win_log 在挥拍窗口逐帧记录 (f_rel, site, ball)，
+        # 球 z 首次下穿 z_plane 的帧号（线性插值）− peak_local 即 τ。
+        # 负 = 挥拍偏晚（球先过面）；None = 窗口内未捕捉到下穿（如触球后
+        # 弹开、或偏差超出 ±10f 窗口）。
+        tau = None
+        for i in range(1, len(win_log)):
+            f_prev, _, b_prev = win_log[i - 1]
+            f_cur, _, b_cur = win_log[i]
+            if b_prev[2] >= z_plane > b_cur[2]:
+                frac = (b_prev[2] - z_plane) / (b_prev[2] - b_cur[2])
+                tau = (f_prev - peak_local) + frac
+                break
+
         if no_swing_reason is not None:
             outcome = "EARLY_GROUND" if early_ground else "NO_SWING"
         elif hit:
@@ -355,12 +390,23 @@ def run_v3(args: V3Args):
             "ball": ball_idx + 1, "outcome": outcome, "hit": hit,
             "t_trigger": t_trigger, "contact_eps": contact_eps,
             "reason": no_swing_reason, "window_log": win_log,
+            "tau_frames": tau,
         })
         min_sd = min((float(np.linalg.norm(b - s)) for _, s, b in win_log), default=None)
         print(f"[V3] [Ball {ball_idx+1:02d}/{args.n_balls}] {outcome:12s} "
               f"min_site_ball={f'{min_sd:.3f}' if min_sd is not None else 'n/a'} "
+              f"tau={'n/a' if tau is None else f'{tau:+.2f}f'} "
               f"t_trig={'-' if t_trigger is None else f'{t_trigger:.2f}'}"
               + (f"  ({no_swing_reason})" if no_swing_reason else ""))
+        if diag:
+            # 常规 τ（链路代数）：t_arr@redir − (hold+2+peak_local)，与实测 τ
+            # 对照可分离"预测误差"与"链路偏置"（差值即预测的过面时刻误差）
+            tau_conv = (diag["t_arr_at_redirect"] / ctrl_dt
+                        - (args.hold_frames + 2 + peak_local))
+            print(f"    [DIAG] tau(cross-peak_meas)="
+                  f"{'n/a' if tau is None else f'{tau:+.2f}f'} "
+                  f"(conv {tau_conv:+.2f}f) t_arr@redir="
+                  f"{diag['t_arr_at_redirect']:.3f}s")
         if diag:
             print(f"    [DIAG] nav_target={np.round(diag['nav_target'],3).tolist()} "
                   f"root_before={np.round(diag['root_before'],3).tolist()} "
@@ -392,8 +438,13 @@ def run_v3(args: V3Args):
 
     n_hit = sum(1 for r in results if r["hit"])
     n = len(results)
+    taus = [r["tau_frames"] for r in results if r["tau_frames"] is not None]
     print(f"\n[V3] ====== SUMMARY ({n} balls) ======")
     print(f"  HIT {n_hit}/{n} = {n_hit/n:.1%}")
+    if taus:
+        print(f"  tau (ball-cross-plane - racket-peak): mean {np.mean(taus):+.2f}f, "
+              f"min {np.min(taus):+.2f}f, max {np.max(taus):+.2f}f, "
+              f"n={len(taus)}/{n} (neg = swing late)")
     print(f"  (acceptance: no worse than 10pp below stationary V0/V1 hit rate)")
 
     out_dir = Path(args.out_dir)

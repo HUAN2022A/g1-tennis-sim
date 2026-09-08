@@ -80,6 +80,9 @@ class RecordArgs:
     z_plane_offset: float = 0.0
     hold_frames: int = 30
     pred_drag_k: float = 0.0125
+    # 与 V1 定稿链路对齐的触发偏置（机理见 tennis_v1_robust.py 同名注释）：
+    # 录像必须复现 V1 的逐球结果，否则摸底日志选出的命中窗口在视频里会翻车。
+    trigger_bias_frames: int = -2
 
     # --- 视频 ---
     video: str = "logs/tennis_demo_v1.mp4"
@@ -182,15 +185,20 @@ def run(args: RecordArgs) -> int:
                 true_pos, _ = get_ball(state.mj_data, ball_adr, ball_dof)
                 observer.update(true_pos, ep_step)
                 if ep_step > launch_step:
+                    # refine_k=False + 固定 k 预测：与 V1 定稿路径一致（V1 在
+                    # σ=5mm 短窗下 7 参数拟合病态；见 §8.2 交接文档），保证
+                    # 录像逐球复现 V1 摸底结果
                     obs = observer.read_fit(ep_step, ctrl_dt,
                                             k=args.pred_drag_k,
-                                            min_points=args.obs_window)
+                                            min_points=args.obs_window,
+                                            refine_k=False)
                     if obs is not None:
-                        opos, ovel, k_est = obs
+                        opos, ovel, _k_est = obs
                         inter_p, t_arr = predict_intercept(
-                            opos, ovel, z_plane=z_plane, k=k_est)
+                            opos, ovel, z_plane=z_plane, k=args.pred_drag_k)
                         if inter_p is not None:
-                            if t_arr - t_lead <= ctrl_dt * 0.5:
+                            if t_arr + args.trigger_bias_frames * ctrl_dt \
+                                    - t_lead <= ctrl_dt * 0.5:
                                 mode = SWING
                                 swing_f = onset
                             elif t_arr <= t_lead + args.arm_horizon:

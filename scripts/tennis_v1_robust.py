@@ -123,6 +123,23 @@ class V1Args:
     # （去偏真实 k 的系统分量，残差不可约）；k=0 对照跑量化"球模型辨识的价值"
     pred_drag_k: float = 0.0125
 
+    # --- 触发时序偏置（正式修正，单位=控制帧）---
+    # 补偿触发链路的系统性偏晚（logs/trigfix_diag.log 8 球仪表化实测）：
+    # 决策帧 n 的拟合状态评估在最新可用观测时刻——observer.update 把步进后
+    # （时刻 (n+1)dt）的球位置记为标签 n，read_fit cutoff=n-1 ⇒ 状态时刻
+    # =n·dt（obs_delay_frames=1 的观测滞后恰在此处生效），t_arr 从 n·dt 起
+    # 算，触发门限 t_arr <= t_lead+0.5dt；而触发后挥拍第一步物理在 (n+1)dt、
+    # site 峰值在 (n+2+peak_local)dt ⇒ 球过拦截面系统性早于拍面峰值 ~2 帧
+    # （实测 τ=球过面时刻-拍面峰值时刻：-1.4~-3.0f，均值 -2.03f，8/8 为负；
+    # 预测过面时刻-真实仅 +0.11f±0.3，偏置全在链路、不在预测）。峰值时刻
+    # 球偏低 ~|vz|·0.04s ≈ 0.15-0.2 m，与 racketfix_accept_diag 18/31 失误
+    # 球偏低 0.10-0.26 m 一致；旧"手镜"朝向竖直环带兜住了该偏差，真实拍面
+    # （法向沿腕系 Z）暴露了它。bias=-2 使 τ 居中（球过面对齐拍面峰值），
+    # 逐档实测 τ 平移 +1f/档：σ=5mm 50球 seed0 命中 38%(bias 0) → 52%(-1)
+    # → 62%(-2，PASS)，干净 20球 50% → 65%（logs/trigfix_bias_*.log、
+    # logs/trigfix_clean20_m2.log）。
+    trigger_bias_frames: int = -2
+
     out_dir: str = "logs/tennis_v1"
 
 
@@ -259,7 +276,8 @@ def run_v1_pass(args: V1Args, sim, infer_fn, ref_traj, cal: dict,
                                     break
                             else:
                                 miss_votes = 0
-                                if t_arr - t_lead <= ctrl_dt * 0.5:
+                                if t_arr + args.trigger_bias_frames * ctrl_dt \
+                                        - t_lead <= ctrl_dt * 0.5:
                                     t_trigger = now
                                     pred_log = (inter_p, t_arr, dev_now)
                                     mode = SWING
