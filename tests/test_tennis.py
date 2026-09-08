@@ -21,7 +21,7 @@ def test_fit_ball_state_reduces_velocity_error():
     t_obs = np.arange(N) * dt
     P_true = np.array([[np.interp(t, ts, traj[:, a]) for a in range(3)] for t in t_obs])
     P_obs = P_true + rng.uniform(-0.005, 0.005, size=P_true.shape)
-    _, v_fit = fit_ball_state(t_obs, P_obs, k=k)
+    _, v_fit, _ = fit_ball_state(t_obs, P_obs, k=k)
     _, v_end = _integrate_state(p0, v0, k, 0.002, (N - 1) * dt)
     # 4 帧 LSQ 斜率基线（速度在窗口中点，含阻力减速失配）
     t4 = t_obs[-4:]
@@ -39,7 +39,7 @@ def test_fit_ball_state_k0_exact():
     v0 = np.array([1.0, 0.0, 0.0])
     tb = np.arange(8) * 0.02
     Pb = np.array([p0 + v0 * t + np.array([0, 0, -0.5 * 9.81 * t * t]) for t in tb])
-    _, vf = fit_ball_state(tb, Pb, k=0.0)
+    _, vf, _ = fit_ball_state(tb, Pb, k=0.0)
     v_true_end = v0 + np.array([0, 0, -9.81]) * tb[-1]
     assert np.linalg.norm(vf - v_true_end) < 1e-8
 

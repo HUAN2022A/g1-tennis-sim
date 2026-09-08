@@ -216,9 +216,9 @@ def run_v2(args: V2Args):
                                             k=args.pred_drag_k,
                                             min_points=args.obs_window)
                     if obs is not None:
-                        opos, ovel = obs
+                        opos, ovel, k_est = obs
                         inter_p, t_arr = predict_intercept(
-                            opos, ovel, z_plane=z_plane, k=args.pred_drag_k)
+                            opos, ovel, z_plane=z_plane, k=k_est)
                         if inter_p is not None:
                             # 按预测拦截点左右侧选片段（body_y 实时读）
                             body_y = float(state.mj_data.qpos[1])

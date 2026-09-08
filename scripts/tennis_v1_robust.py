@@ -225,9 +225,9 @@ def run_v1_pass(args: V1Args, sim, infer_fn, ref_traj, cal: dict,
                                             k=args.pred_drag_k,
                                             min_points=args.obs_window)
                     if obs is not None:
-                        opos, ovel = obs
+                        opos, ovel, k_est = obs
                         inter_p, t_arr = predict_intercept(
-                            opos, ovel, z_plane=z_plane, k=args.pred_drag_k)
+                            opos, ovel, z_plane=z_plane, k=k_est)
                         if inter_p is not None:
                             dev_now = np.linalg.norm(inter_p - p_swing)
                             # NO_SWING 判据要稳健：预测需已收敛（剩余时间

@@ -42,7 +42,7 @@ from utils.ball_obs import BallObserver
 from utils.tennis_clips import load_segment, reset_to_frame, calibrate, shift_ref_root
 from utils.tennis_ball import (
     sample_serve, apply_ball_dr, restore_ball_physics,
-    snapshot_ball_physics, step_with_drag,
+    snapshot_ball_physics, step_with_drag, apply_drag,
 )
 from utils.goto import GotoController
 from deploy.walk_policy import WalkPolicy
@@ -93,15 +93,23 @@ class V3Args:
     pred_drag_k: float = 0.0125
 
     # --- 步行 / 重定向 ---
-    start_offset: tuple = (0.4, 0.0)   # 机器人初始相对 onset 的位移（米）
+    start_offset: tuple = (-0.4, 0.0)  # 机器人初始相对 onset 的位移（米）
     arrive_dist: float = 0.20          # goto 到达阈值
-    settle_margin: float = 0.25        # 触发前需提前到达的余量（秒）
+    redirect_lead: float = 0.90        # 重定向时机（秒）：t_arr 降到该值以下才重定向。
+                                       # = (hold_frames + peak_local + 补偿帧) 时长，使
+                                       # 重定向→固定站桩 hold_frames→挥拍峰值 正好对准球到达，
+                                       # 同时让站桩 hold 时长与标定一致（标定陷阱）。
 
     out_dir: str = "logs/tennis_v3"
 
 
-def walk_step(sim, state, walk_policy: WalkPolicy, cmd_vel: np.ndarray):
-    """一个控制步的步行（walk policy + KPs_walking/KDs_walking PD）。"""
+def walk_step(sim, state, walk_policy: WalkPolicy, cmd_vel: np.ndarray,
+              ball_dof: int, ball_body_id: int, k_drag: float):
+    """一个控制步的步行（walk policy + KPs_walking/KDs_walking PD）。
+
+    与 step_with_drag 一致地给球施加空气阻力——球物理不能随状态机模式切换，
+    否则 WALK 段球按纯抛体飞、发球/预测却按带阻力设计，拦截点预测整体失真。
+    """
     if sim.mj_model.nq > 36:
         jnt_qpos = state.mj_data.qpos[7:36]
         jnt_qvel = state.mj_data.qvel[6:35]
@@ -112,10 +120,12 @@ def walk_step(sim, state, walk_policy: WalkPolicy, cmd_vel: np.ndarray):
     motor = walk_policy.infer(state.mj_data.qpos[3:7], gyro,
                               jnt_qpos, jnt_qvel, cmd_vel.astype(np.float32))
     for _ in range(sim.num_sim_substeps):
+        apply_drag(state.mj_data, ball_dof, ball_body_id, sim.mj_model, k_drag)
         torques = KPs_walking * (motor - jnt_qpos) + KDs_walking * (-jnt_qvel)
         torques = np.clip(torques, -consts.TORQUE_LIMIT, consts.TORQUE_LIMIT)
         state.mj_data.ctrl[:] = torques
         mujoco.mj_step(sim.mj_model, state.mj_data)
+    state.mj_data.qfrc_applied[:] = 0.0
     return state
 
 
@@ -139,6 +149,16 @@ def reset_to_standing(sim, infer_fn, start_xy, ball_adr, ball_dof):
     return state
 
 
+def _site_fk(sim, site_id, qpos_36, scratch) -> np.ndarray:
+    """给定 36 维 qpos 做纯前向运动学，返回 racket_point site 世界位置。
+
+    这是"参考拍面位置"（无跟踪误差）——用于区分"跟踪没跟上"还是"球/时序错了"。
+    """
+    scratch.qpos[:36] = qpos_36
+    mujoco.mj_forward(sim.mj_model, scratch)
+    return scratch.site_xpos[site_id].copy()
+
+
 def run_v3(args: V3Args):
     ctrl_dt = 1.0 / args.freq
     env_cfg = g1_infer_env_config(ctrl_dt=ctrl_dt)
@@ -149,6 +169,7 @@ def run_v3(args: V3Args):
     sim, site_id, ball_adr, ball_dof = build_tennis_sim(
         racket_mass=args.racket_mass, ctrl_dt=ctrl_dt, sim_dt=args.sim_dt)
     infer_fn = G1TrackInferFn(env_cfg, sim.mj_model, policy, privileged=False)
+    scratch = mujoco.MjData(sim.mj_model)
 
     ref_traj = load_segment(args.track, args.convert_xml_path, args.freq)
     cal = calibrate(sim, infer_fn, ref_traj, site_id, ball_adr, ball_dof,
@@ -177,6 +198,15 @@ def run_v3(args: V3Args):
         restore_ball_physics(sim.mj_model, base_phys)
         dr = apply_ball_dr(sim.mj_model, rng,
                            k_lo=args.dr_k_lo, k_hi=args.dr_k_hi)
+        # 真值拦截点（用真实采样 k 积分）——区分"预测偏差"与"球真不可达"
+        true_inter_p, _ = predict_intercept(serve_pos, serve_vel, z_plane=z_plane,
+                                            k=dr["k_drag"])
+        serve_diag = {
+            "T_flight": T_flight, "launch_step": launch_step,
+            "target": target.copy(), "serve_pos": serve_pos.copy(),
+            "true_inter_p": true_inter_p.copy() if true_inter_p is not None else None,
+            "k_true": dr["k_drag"],
+        }
         observer = BallObserver(pos_sigma=args.obs_sigma,
                                 dropout_p=args.obs_dropout_p,
                                 delay_frames=args.obs_delay_frames,
@@ -198,6 +228,8 @@ def run_v3(args: V3Args):
         no_swing_reason = None
         early_ground = False
         win_log = []
+        diag = {}
+        hold_count = 0
         max_ep_steps = launch_step + int(T_flight * args.freq) + 120
 
         while ep_step < max_ep_steps:
@@ -209,7 +241,8 @@ def run_v3(args: V3Args):
             if mode == WALK:
                 if ep_step < launch_step:
                     # 发射前原地站桩（walk policy 停）
-                    state = walk_step(sim, state, walk_policy, np.zeros(3))
+                    state = walk_step(sim, state, walk_policy, np.zeros(3),
+                                      ball_dof, ball_body_id, dr["k_drag"])
                 else:
                     true_pos, _ = get_ball(state.mj_data, ball_adr, ball_dof)
                     observer.update(true_pos, ep_step)
@@ -222,17 +255,18 @@ def run_v3(args: V3Args):
                                             k=args.pred_drag_k,
                                             min_points=args.obs_window)
                     if obs is not None:
-                        opos, ovel = obs
+                        opos, ovel, k_est = obs
                         inter_p, t_arr = predict_intercept(
-                            opos, ovel, z_plane=z_plane, k=args.pred_drag_k)
+                            opos, ovel, z_plane=z_plane, k=k_est)
                         if inter_p is not None:
-                            # 导航目标：让 P_swing 落到拦截点
-                            nav_target = onset_root + (inter_p - p_swing)[:2]
+                            # 导航目标固定为 onset_root（标称拦截点）。实际拦截偏移
+                            # 在重定向瞬间用已收敛的预测统一施加——否则早期预测噪声
+                            # 会让 nav_target 漂移，慢速步行来不及绕回。
+                            nav_target = onset_root
                             root_xy = state.mj_data.qpos[0:2]
                             root_yaw = quat2yaw(state.mj_data.qpos[3:7])
                             dist = float(np.linalg.norm(nav_target - root_xy))
-                            if dist < args.arrive_dist \
-                                    and (t_arr - t_lead) >= args.settle_margin:
+                            if dist < args.arrive_dist and t_arr <= args.redirect_lead:
                                 # 到达且时间充足：重定向挥拍到实际拦截点，进入 TRACK
                                 # （保留飞行中的球：reset 会重置球 freejoint）
                                 ball_qpos = state.mj_data.qpos[ball_adr:ball_adr + 7].copy()
@@ -243,34 +277,38 @@ def run_v3(args: V3Args):
                                     sim, infer_fn, ref_cur, onset, ball_adr, ball_dof,
                                     zero_root_vel=True, ball_state=(ball_qpos, ball_qvel))
                                 ref_hold = jtu.tree_map(lambda x: x[onset][None], ref_cur)
+                                diag = {
+                                    "nav_target": nav_target.copy(),
+                                    "root_before": root_xy.copy(),
+                                    "offset": np.asarray(offset, dtype=np.float64).copy(),
+                                    "inter_p": inter_p.copy(),
+                                    "t_arr_at_redirect": float(t_arr),
+                                    "root_after": state.mj_data.qpos[0:2].copy(),
+                                    "ball_at_redirect": ball_qpos[0:3].copy(),
+                                    "redirect_step": ep_step,
+                                }
+                                hold_count = 0
                                 mode = TRACK
                             else:
                                 cmd_vel = goto.cmd_vel(root_xy, root_yaw, nav_target)
-                                state = walk_step(sim, state, walk_policy, cmd_vel)
+                                state = walk_step(sim, state, walk_policy, cmd_vel,
+                                                  ball_dof, ball_body_id, dr["k_drag"])
                     else:
-                        state = walk_step(sim, state, walk_policy, np.zeros(3))
+                        state = walk_step(sim, state, walk_policy, np.zeros(3),
+                                          ball_dof, ball_body_id, dr["k_drag"])
 
             elif mode in (TRACK, ARM):
                 motor = infer_fn.infer_onnx(state, {"ref_curr": ref_hold, "ref_next": ref_hold})
                 state = step_with_drag(sim, state, motor, ball_dof, ball_body_id, dr["k_drag"])
                 true_pos, _ = get_ball(state.mj_data, ball_adr, ball_dof)
                 observer.update(true_pos, ep_step)
-                now = ep_step * ctrl_dt
-                obs = observer.read_fit(ep_step, ctrl_dt, k=args.pred_drag_k,
-                                        min_points=args.obs_window)
-                if obs is not None:
-                    opos, ovel = obs
-                    inter_p, t_arr = predict_intercept(opos, ovel, z_plane=z_plane,
-                                                       k=args.pred_drag_k)
-                    if inter_p is not None:
-                        # V3 已重定向挥拍到拦截点，不按 p_swing 判 miss（机器人
-                        # 会走到真实落点）。只按剩余飞行时间触发。
-                        if t_arr - t_lead <= ctrl_dt * 0.5:
-                            t_trigger = now
-                            mode = SWING
-                            swing_f = onset
-                        elif t_arr <= t_lead + args.arm_horizon:
-                            mode = ARM
+                # 固定站桩 hold_frames（与标定一致），到点即挥拍——不与 t_arr
+                # 耦合，避免站桩时长偏离标定导致挥拍跟踪漂移。
+                hold_count += 1
+                if hold_count >= args.hold_frames:
+                    t_trigger = ep_step * ctrl_dt
+                    mode = SWING
+                    swing_f = onset
                 if true_pos[2] < 0.05 and mode in (TRACK, ARM):
                     early_ground = True
                     no_swing_reason = "ball hit ground before trigger"
@@ -290,6 +328,13 @@ def run_v3(args: V3Args):
                         spos, _, _ = site_state(sim.mj_model, state.mj_data, site_id)
                         bpos, _ = get_ball(state.mj_data, ball_adr, ball_dof)
                         win_log.append((f_rel, spos.copy(), bpos.copy()))
+                    if f_rel == peak_local:
+                        diag["site_at_peak"] = site_state(
+                            sim.mj_model, state.mj_data, site_id)[0].copy()
+                        diag["ball_at_peak"] = get_ball(
+                            state.mj_data, ball_adr, ball_dof)[0].copy()
+                        diag["ref_site_at_peak"] = _site_fk(
+                            sim, site_id, ref_cur["qpos"][swing_f], scratch)
                     if contact_event(sim.mj_model, state.mj_data):
                         hit = True
                         contact_eps.append(ep_step)
@@ -316,6 +361,32 @@ def run_v3(args: V3Args):
               f"min_site_ball={f'{min_sd:.3f}' if min_sd is not None else 'n/a'} "
               f"t_trig={'-' if t_trigger is None else f'{t_trigger:.2f}'}"
               + (f"  ({no_swing_reason})" if no_swing_reason else ""))
+        if diag:
+            print(f"    [DIAG] nav_target={np.round(diag['nav_target'],3).tolist()} "
+                  f"root_before={np.round(diag['root_before'],3).tolist()} "
+                  f"root_after={np.round(diag['root_after'],3).tolist()}")
+            print(f"    [DIAG] offset={np.round(diag['offset'],3).tolist()} "
+                  f"inter_p={np.round(diag['inter_p'],3).tolist()} "
+                  f"t_arr@redir={diag['t_arr_at_redirect']:.3f} "
+                  f"walk_steps={diag['redirect_step']} ({diag['redirect_step']*ctrl_dt:.2f}s)")
+            print(f"    [DIAG] T_flight={serve_diag['T_flight']:.2f} "
+                  f"launch_step={serve_diag['launch_step']} "
+                  f"k_true={serve_diag['k_true']:.4f} "
+                  f"target={np.round(serve_diag['target'],3).tolist()}")
+            ti = serve_diag['true_inter_p']
+            if ti is not None:
+                print(f"    [DIAG] true_inter_p={np.round(ti,3).tolist()} "
+                      f"|true-p_swing|={np.linalg.norm(ti-p_swing):.3f} "
+                      f"|pred_inter_p-true|={np.linalg.norm(diag['inter_p']-ti):.3f}")
+            if "site_at_peak" in diag:
+                print(f"    [DIAG] p_swing={np.round(p_swing,3).tolist()}")
+                print(f"    [DIAG] site@peak={np.round(diag['site_at_peak'],3).tolist()} "
+                      f"ref_site@peak={np.round(diag['ref_site_at_peak'],3).tolist()}")
+                print(f"    [DIAG] ball@peak={np.round(diag['ball_at_peak'],3).tolist()}")
+                print(f"    [DIAG] |site-ref|={np.linalg.norm(diag['site_at_peak']-diag['ref_site_at_peak']):.3f} "
+                      f"|site-ball|={np.linalg.norm(diag['site_at_peak']-diag['ball_at_peak']):.3f} "
+                      f"|site-(p_swing+offset)|={np.linalg.norm(diag['site_at_peak']-(p_swing+np.r_[diag['offset'],0.0])):.3f} "
+                      f"|ball-inter_p|={np.linalg.norm(diag['ball_at_peak']-diag['inter_p']):.3f}")
 
     restore_ball_physics(sim.mj_model, base_phys)
 

@@ -112,5 +112,5 @@ class BallObserver:
         t = np.asarray([s for s, _ in seg], dtype=np.float64) * ctrl_dt
         P = np.asarray([p for _, p in seg], dtype=np.float64)
         t_eval = step * ctrl_dt if compensate_delay else None
-        pos, vel = fit_ball_state(t, P, k=k, t_eval=t_eval)
-        return pos, vel
+        pos, vel, k_est = fit_ball_state(t, P, k=k, t_eval=t_eval)
+        return pos, vel, k_est

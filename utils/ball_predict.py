@@ -99,17 +99,17 @@ def _sample_positions(pos: np.ndarray, vel: np.ndarray, k: float,
 
 
 def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
-                   t_eval: float | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """对含噪观测位置做弹道(+阻力)拟合，返回 (pos, vel) 于 t_eval 时刻。
+                   t_eval: float | None = None) -> tuple[np.ndarray, np.ndarray, float]:
+    """对含噪观测位置做弹道(+阻力)拟合，返回 (pos, vel, k_est) 于 t_eval 时刻。
 
     Args:
-        t_obs: (N,) 绝对时间（秒）；p_obs: (N,3) 观测位置；k: 阻力系数。
+        t_obs: (N,) 绝对时间（秒）；p_obs: (N,3) 观测位置；k: 阻力系数先验。
         t_eval: 求值时刻（秒），默认最新观测 t_obs[-1]。
 
-    先用 k=0 闭式二次拟合初始化 (p0, v0)；k>0 时用 Gauss-Newton 细化
-    （前向模型复用 predict_ball_trajectory，6 参数 (p0, v0) 有限差分雅可比）。
-    相比 4 帧 LSQ 斜率，模型约束压制了速度噪声且天然处理阻力减速，
-    并把状态评估到最新观测时刻（消除 LSQ 的中点滞后）。
+    先用 k=0 闭式二次拟合初始化 (p0, v0)；k>0 时用 Gauss-Newton 同时细化
+    (p0, v0, k)（前向模型复用 predict_ball_trajectory，7 参数有限差分雅可比）。
+    返回的 k_est 是观测窗内辨识出的真实阻力系数——长滞空下阻力失配会放大成
+    拦截点预测偏差，固定先验 k 无法适应域随机化的真实 k，必须在线估计。
     """
     t_obs = np.asarray(t_obs, dtype=np.float64).reshape(-1)
     p_obs = np.asarray(p_obs, dtype=np.float64)
@@ -119,7 +119,7 @@ def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
     t0 = t_obs[0]
     t_rel = t_obs - t0
     if t_rel[-1] <= 0:
-        return p_obs[-1].copy(), np.zeros(3)
+        return p_obs[-1].copy(), np.zeros(3), float(k)
 
     # 1) 初始化：k=0 逐轴二次拟合（p(t) = p0 + v0*t + 0.5*a*t^2）
     A = np.column_stack([np.ones(n), t_rel, t_rel * t_rel])
@@ -127,25 +127,27 @@ def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
     p0 = coef[0].copy()
     v0 = coef[1].copy()
 
-    # 2) k>0 Gauss-Newton 细化 (p0, v0)
+    # 2) k>0 Gauss-Newton 细化 (p0, v0, k)
+    k_est = float(k)
     if k > 0:
-        pred = _sample_positions(p0, v0, k, t_rel)
-        for _ in range(3):
+        pred = _sample_positions(p0, v0, k_est, t_rel)
+        for _ in range(6):
             resid = (pred - p_obs).ravel()
-            base = np.concatenate([p0, v0])
-            eps = 1e-6
-            J = np.empty((3 * n, 6))
-            for j in range(6):
+            base = np.concatenate([p0, v0, [k_est]])
+            J = np.empty((3 * n, 7))
+            for j in range(7):
                 pert = base.copy()
-                pert[j] += eps
-                pred_p = _sample_positions(pert[:3], pert[3:], k, t_rel)
-                J[:, j] = (pred_p - pred).ravel() / eps
-            delta, *_ = np.linalg.lstsq(J.T @ J + 1e-9 * np.eye(6),
+                h = 1e-3 if j == 6 else 1e-6
+                pert[j] += h
+                pred_p = _sample_positions(pert[:3], pert[3:6], pert[6], t_rel)
+                J[:, j] = (pred_p - pred).ravel() / h
+            delta, *_ = np.linalg.lstsq(J.T @ J + 1e-9 * np.eye(7),
                                        -J.T @ resid, rcond=None)
             p0 = p0 + delta[:3]
-            v0 = v0 + delta[3:]
-            pred = _sample_positions(p0, v0, k, t_rel)
-            if np.linalg.norm(delta) < 1e-6:
+            v0 = v0 + delta[3:6]
+            k_est = float(np.clip(k_est + delta[6], 0.0, 0.05))
+            pred = _sample_positions(p0, v0, k_est, t_rel)
+            if np.linalg.norm(delta) < 1e-7:
                 break
 
     # 3) 评估到 t_eval
@@ -153,5 +155,6 @@ def fit_ball_state(t_obs: np.ndarray, p_obs: np.ndarray, k: float = 0.0,
         t_eval = t_obs[-1]
     dur = float(t_eval) - t0
     if dur <= 0:
-        return p0.copy(), v0.copy()
-    return _integrate_state(p0, v0, k, 0.002, dur)
+        return p0.copy(), v0.copy(), k_est
+    pos, vel = _integrate_state(p0, v0, k_est, 0.002, dur)
+    return pos, vel, k_est
