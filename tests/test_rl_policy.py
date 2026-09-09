@@ -115,6 +115,14 @@ def get_ort_session():
 # a. 随机批对齐
 # ---------------------------------------------------------------------------
 
+def _align_tol():
+    """flax vs onnxruntime 对齐容差：GPU 上 jax matmul 走 cuBLAS（累加顺序与
+    CPU 的 MKL/OpenBLAS 不同），f32 累差天然 ~5e-5（实测），故放宽到 1e-4；
+    CPU 上保持 1e-5 严格口径（实测 8e-6）。"""
+    import jax
+    return 1e-4 if any(d.platform == "gpu" for d in jax.devices()) else 1e-5
+
+
 def test_random_batch_onnx_vs_flax():
     assert DEFAULT_NPZ.exists(), (
         f"缺少 {DEFAULT_NPZ}，先运行: "
@@ -130,7 +138,8 @@ def test_random_batch_onnx_vs_flax():
     assert out.shape == ref.shape == (4096, 29)
     max_abs = float(np.abs(out - ref).max())
     print(f"  随机批 4096: max|Δ|={max_abs:.3e}")
-    assert max_abs < 1e-5, f"flax vs onnxruntime 随机批偏差 {max_abs:.3e} >= 1e-5"
+    assert max_abs < _align_tol(), \
+        f"flax vs onnxruntime 随机批偏差 {max_abs:.3e} >= {_align_tol()}"
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +155,8 @@ def test_real_traj_policy_alignment():
     max_abs = float(np.abs(out - frames["nn_action"]).max())
     print(f"  真实轨迹 {n} 帧: max|Δ|={max_abs:.3e} "
           f"|nn_action|max={np.abs(frames['nn_action']).max():.3f}")
-    assert max_abs < 1e-5, f"flax vs 录制 nn_action 偏差 {max_abs:.3e} >= 1e-5"
+    assert max_abs < _align_tol(), \
+        f"flax vs 录制 nn_action 偏差 {max_abs:.3e} >= {_align_tol()}"
 
 
 def test_real_traj_get_nn_state_alignment():

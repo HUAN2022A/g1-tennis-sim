@@ -169,21 +169,23 @@ scp -r "storage/data/mocap/Tennis/p1/Random_00{1,2,3,4}_Tennis 001.npz" server:r
 #       帧数不一致的 npz 会崩。
 
 # 3. 冒烟（确认 calib traj_len 匹配 + loss 无 NaN）
-CUDA_VISIBLE_DEVICES=1 uv run python rl/train_ppo.py --smoke
+#    ⚠️ 必须 JAX_DEFAULT_MATMUL_PRECISION=highest：jax GPU 默认 tf32 低精度 matmul，
+#       冻结策略 flax 推理偏离 f64 精确值 ~2e-2（正常应 1e-5），拖累跟踪精度（§4 坑 10）
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python rl/train_ppo.py --smoke
 
 # 3b. 全量回归（冻结策略/球观测/环境转移的回归，勿跳过）
-CUDA_VISIBLE_DEVICES=1 uv run python tests/test_rl_ball.py
-CUDA_VISIBLE_DEVICES=1 uv run python tests/test_rl_env.py
-CUDA_VISIBLE_DEVICES=1 uv run python tests/test_rl_policy.py
-CUDA_VISIBLE_DEVICES=1 uv run python tests/test_rl_train.py
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python tests/test_rl_ball.py
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python tests/test_rl_env.py
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python tests/test_rl_policy.py
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python tests/test_rl_train.py
 
 # 4. 训练（eval 命中率 ≥65% 持续 = 阶段 2 成立）
-CUDA_VISIBLE_DEVICES=1 uv run python rl/train_ppo.py --train --num-envs 512 \
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python rl/train_ppo.py --train --num-envs 512 \
   --total-iters 2000 --eval-interval 10 --eval-balls 200 --seed 0
 
 # 5. 评估 / 探针
-CUDA_VISIBLE_DEVICES=1 uv run python rl/train_ppo.py --eval --ckpt storage/ckpts/rl/residual_ppo.pkl --n-balls 200
-CUDA_VISIBLE_DEVICES=1 uv run python rl/train_ppo.py --probe --num-envs 64 --n-balls 200
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python rl/train_ppo.py --eval --ckpt storage/ckpts/rl/residual_ppo.pkl --n-balls 200
+CUDA_VISIBLE_DEVICES=1 JAX_DEFAULT_MATMUL_PRECISION=highest uv run python rl/train_ppo.py --probe --num-envs 64 --n-balls 200
 ```
 
 断线/OOM 恢复：`--train --resume <ckpt>`（checkpoint 为 pickle，含 params+opt+step+seed+rng）。
@@ -209,6 +211,15 @@ CUDA_VISIBLE_DEVICES=1 uv run python rl/train_ppo.py --probe --num-envs 64 --n-b
    单 rollout（8 env × ~150 步）~3-10s（冻结策略前向 + 弹道积分 read_fit/predict_intercept
    为瓶颈）。完整 200 球探针在 CPU 上 ~20min+ 且随内存压力退化；服务器 GPU 快 ~100×，
    **完整验收（探针/训练）应在服务器跑**，本地只做冒烟 + 单测。
+10. **jax GPU 默认 tf32（低精度 matmul）**：RTX Ada 上 jax matmul 默认用 tf32，
+    冻结策略 flax 推理偏离 f64 精确值 ~2.17e-2（正常应 1e-5）；onnxruntime 仍 1.67e-5。
+    **训练/测试必须 `JAX_DEFAULT_MATMUL_PRECISION=highest`**（实测修复后 flax vs f64
+    降到 1.10e-5）。test_rl_policy 的 flax↔onnx 对齐阈值按设备自适应（GPU 1e-4、
+    CPU 1e-5），因 GPU cuBLAS 累加顺序与 CPU MKL 不同、f32 累差天然 ~5e-5。
+11. **GPU MJX 物理非确定**：同 seed 两次 rollout 球轨迹差 ~0.1-0.2m（contact solver
+    并行 reduce + 混沌放大），逐位复现不可能。test_rl_train 的 determinism 只断言
+    reset 随机数逐位 + old_logp 统计一致（探索噪声由确定的 ctx.rng 派生）。GPU 固有
+    特性，不影响训练正确性（RL 本就是随机探索，checkpoint resume 有微小轨迹差异）。
 
 ## 5. 下一步（阶段 2/3 判定）
 
