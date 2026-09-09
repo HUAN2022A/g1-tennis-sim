@@ -210,6 +210,8 @@ class ResidualCtx(NamedTuple):
     ep_step: jax.Array         # (B,) int32 控制步计数（全体同相位）
     launch_step: jax.Array     # (B,) int32 本回合发射步
     mode: jax.Array            # (B,) int32 本步执行的模式 MODE_*
+    active: jax.Array          # (B,) bool 本步是否有效（= ~done0；挥拍耗尽/NO_SWING
+                               #   后为 False，供残差门控抑制无梯度信号的尾部扰动）
     rng: jax.Array             # (B,2) 本步 state.rng（观测噪声流 key，只读）
 
 
@@ -563,7 +565,7 @@ class TennisEnv:
                 inter_p=fit_inter, t_arr=fit_tarr, found=fit_found,
                 site_pos=site_pos_pre, root_pos=root_pos, root_yaw=root_yaw,
                 ep_step=state.ep_step, launch_step=state.launch_step,
-                mode=mode, rng=state.rng)
+                mode=mode, active=active, rng=state.rng)
             delta = jnp.asarray(residual_fn(obs, ctx, state.res_params),
                                 dtype=jnp.float32)
             nn_action = nn_action.at[:, 26:29].add(delta)
