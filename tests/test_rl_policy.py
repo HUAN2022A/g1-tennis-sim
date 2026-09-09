@@ -159,6 +159,9 @@ def test_real_traj_policy_alignment():
         f"flax vs 录制 nn_action 偏差 {max_abs:.3e} >= {_align_tol()}"
 
 
+_SEM_TOL = 5e-6  # 纯元素语义对齐（get_nn_state/nn2motor/update_coord_cmd）的 f32 舍入容差
+
+
 def test_real_traj_get_nn_state_alignment():
     import jax.numpy as jnp
 
@@ -178,7 +181,7 @@ def test_real_traj_get_nn_state_alignment():
     obs = np.asarray(state)
     max_abs = float(np.abs(obs - frames["obs"]).max())
     print(f"  get_nn_state jax vs numpy: max|Δ|={max_abs:.3e}")
-    assert max_abs < 1e-6, f"get_nn_state 偏差 {max_abs:.3e} >= 1e-6"
+    assert max_abs < _SEM_TOL, f"get_nn_state 偏差 {max_abs:.3e} >= {_SEM_TOL}"
 
 
 def _numpy_update_coord_cmd(qpos, ref_curr_qpos):
@@ -217,14 +220,14 @@ def test_real_traj_update_coord_cmd_alignment():
     d_xy = float(np.abs(np.asarray(xy_jax) - xy_np).max())
     print(f"  update_coord_cmd jax vs numpy(f32 输入): "
           f"yaw max|Δ|={d_yaw:.3e} xy max|Δ|={d_xy:.3e}")
-    assert d_yaw < 1e-6 and d_xy < 1e-6, (d_yaw, d_xy)
+    assert d_yaw < _SEM_TOL and d_xy < _SEM_TOL, (d_yaw, d_xy)
 
     # 对录制值（numpy f64 输入计算）另作参考：容差放宽为 f64->f32 输入舍入量级
     d_yaw64 = float(np.abs(np.asarray(yaw_jax) - frames["yaw_d"]).max())
     d_xy64 = float(np.abs(np.asarray(xy_jax) - frames["xy_d"]).max())
     print(f"  update_coord_cmd jax vs 录制值(f64 输入): "
           f"yaw max|Δ|={d_yaw64:.3e} xy max|Δ|={d_xy64:.3e}")
-    assert d_yaw64 < 1e-6 and d_xy64 < 5e-6, (d_yaw64, d_xy64)
+    assert d_yaw64 < _SEM_TOL and d_xy64 < _SEM_TOL, (d_yaw64, d_xy64)
 
 
 def test_real_traj_nn2motor_alignment():
@@ -234,7 +237,7 @@ def test_real_traj_nn2motor_alignment():
     motor = np.asarray(nn2motor_action(jnp.asarray(frames["nn_action"], dtype=jnp.float32)))
     max_abs = float(np.abs(motor - frames["motor_targets"]).max())
     print(f"  nn2motor_action jax vs numpy: max|Δ|={max_abs:.3e}")
-    assert max_abs < 1e-6, f"nn2motor_action 偏差 {max_abs:.3e} >= 1e-6"
+    assert max_abs < _SEM_TOL, f"nn2motor_action 偏差 {max_abs:.3e} >= {_SEM_TOL}"
 
 
 if __name__ == "__main__":
