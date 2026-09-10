@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网球击球闭环 · 右腕残差 RL 设计思路</title>
+<style>
+  :root {
+    --bg: #f7f8f6;
+    --card: #ffffff;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --green: #2e7d32;
+    --green-light: #e8f5e9;
+    --yellow: #f9a825;
+    --blue: #1565c0;
+    --blue-light: #e3f2fd;
+    --orange: #e65100;
+    --orange-light: #fff3e0;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; }
+  header.hero {
+    background: linear-gradient(135deg, #1b5e20, #2e7d32);
+    color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px;
+  }
+  header.hero h1 { margin: 0 0 10px; font-size: 28px; letter-spacing: .5px; }
+  header.hero p { margin: 0; opacity: .92; font-size: 15px; }
+  .badge {
+    display: inline-block; background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.35);
+    border-radius: 999px; padding: 3px 12px; font-size: 12px; margin-right: 8px; margin-bottom: 6px;
+  }
+  h2 {
+    font-size: 20px; margin: 40px 0 16px; padding-left: 12px;
+    border-left: 4px solid var(--green); display: flex; align-items: center; gap: 8px;
+  }
+  h2 .n { background: var(--green); color: #fff; border-radius: 6px; width: 24px; height: 24px;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 13px; margin-left: -12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
+  .card h3 { margin: 0 0 12px; font-size: 16px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { border-bottom: 1px solid var(--border); padding: 8px 10px; text-align: left; }
+  th { background: #fafafa; color: var(--muted); font-weight: 600; }
+  td code, .mono { font-family: "SF Mono", "Consolas", "Menlo", monospace; font-size: 13px; }
+  .svgbox { overflow-x: auto; }
+  .tag { font-weight: 600; }
+  .tag.frozen { color: var(--blue); }
+  .tag.train { color: var(--orange); }
+  .callout {
+    border-left: 4px solid var(--yellow); background: #fffde7; border-radius: 8px;
+    padding: 14px 18px; margin: 16px 0; font-size: 14px;
+  }
+  .pill { display:inline-block; border-radius: 6px; padding: 2px 8px; font-size: 12px; font-weight:600; }
+  .pill.blue { background: var(--blue-light); color: var(--blue); }
+  .pill.orange { background: var(--orange-light); color: var(--orange); }
+  .pill.green { background: var(--green-light); color: var(--green); }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; }
+  .kpi { display:flex; gap: 24px; flex-wrap: wrap; margin: 8px 0 4px; }
+  .kpi .box { background: var(--green-light); border-radius: 10px; padding: 14px 20px; min-width: 140px; }
+  .kpi .box .v { font-size: 26px; font-weight: 700; color: var(--green); }
+  .kpi .box .l { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>🎾 网球击球闭环 · 右腕残差 RL 设计思路</h1>
+    <p>冻结底层跟踪策略，只训练一个 3 维右腕残差 —— 把命中率从规则状态机的 62% 天花板抬到 ~93%</p>
+    <div style="margin-top:12px">
+      <span class="badge">LATENT 路线简化版</span>
+      <span class="badge">PPO + GAE</span>
+      <span class="badge">MJX 批量仿真 512 env</span>
+      <span class="badge">2000 迭代</span>
+    </div>
+  </header>
+
+  <div class="kpi">
+    <div class="box"><div class="v">62% → 93%</div><div class="l">命中率（零残差基线 → 训练后）</div></div>
+    <div class="box"><div class="v">3 维</div><div class="l">右腕残差 δ（roll/pitch/yaw）</div></div>
+    <div class="box"><div class="v">292 万 → 2.3 万</div><div class="l">冻结策略 / 可训练残差策略参数量</div></div>
+  </div>
+
+  <!-- 1. 核心思想 -->
+  <h2><span class="n">1</span> 核心思想：冻结底层 + 只学腕部</h2>
+  <div class="card">
+    <p style="margin-top:0">底层是一个 <span class="tag frozen">冻结的跟踪策略</span>（<code>pns_wo_priv264</code>，136→2048→1024→512→29 + SiLU），在 MJX 批量网球环境里跑 V1 状态机，零残差命中率 <strong>62%</strong>——这是规则状态机「选片段 + 触发时机」够不着的天花板。</p>
+    <p>训练的是一个小 MLP，只输出 <span class="tag train">右腕 3 个关节的修正量 δ</span>，叠加到冻结策略输出上，用强化学习补上命中精度。</p>
+    <div class="callout">
+      <strong>依据</strong>：LATENT 论文消融证明「腕部修正」是击球/落点精度的关键来源（去掉腕部修正，正手成功率 96.5% → 82.4%）。我们的规则状态机没有这个接口，62% 就是它的极限。
+    </div>
+  </div>
+
+  <!-- 2. 架构总览 -->
+  <h2><span class="n">2</span> 架构总览（数据流）</h2>
+  <div class="card">
+    <div class="svgbox">
+    <svg viewBox="0 0 940 360" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 z" fill="#6b7280"/>
+        </marker>
+        <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 z" fill="#e65100"/>
+        </marker>
+      </defs>
+
+      <!-- 主链：obs -> 冻结策略 -> nn_action -> +δ -> nn2motor -->
+      <rect x="20" y="70" width="120" height="56" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+      <text x="80" y="94" text-anchor="middle" font-size="13" fill="#1565c0" font-weight="700">obs</text>
+      <text x="80" y="112" text-anchor="middle" font-size="11" fill="#555">(136 维)</text>
+
+      <rect x="180" y="58" width="180" height="80" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+      <text x="270" y="84" text-anchor="middle" font-size="14" fill="#1565c0" font-weight="700">冻结跟踪策略</text>
+      <text x="270" y="102" text-anchor="middle" font-size="11" fill="#555">pns_wo_priv264</text>
+      <text x="270" y="118" text-anchor="middle" font-size="11" fill="#555">136→2048→1024→512→29</text>
+      <text x="270" y="132" text-anchor="middle" font-size="11" fill="#888">🔒 292 万参数 · 不训练</text>
+
+      <rect x="410" y="70" width="130" height="56" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+      <text x="475" y="94" text-anchor="middle" font-size="13" font-weight="700">nn_action</text>
+      <text x="475" y="112" text-anchor="middle" font-size="11" fill="#555">(29 维)</text>
+
+      <circle cx="585" cy="98" r="26" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
+      <text x="585" y="94" text-anchor="middle" font-size="16" fill="#e65100" font-weight="700">+ δ</text>
+      <text x="585" y="110" text-anchor="middle" font-size="10" fill="#e65100">右腕 26:29</text>
+
+      <rect x="655" y="70" width="130" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+      <text x="720" y="94" text-anchor="middle" font-size="13" font-weight="700">nn2motor</text>
+      <text x="720" y="112" text-anchor="middle" font-size="11" fill="#555">电机目标</text>
+
+      <rect x="825" y="70" width="90" height="56" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+      <text x="870" y="94" text-anchor="middle" font-size="13" font-weight="700">机器人</text>
+      <text x="870" y="112" text-anchor="middle" font-size="11" fill="#555">击球</text>
+
+      <!-- 主链箭头 -->
+      <line x1="140" y1="98" x2="178" y2="98" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+      <line x1="360" y1="98" x2="408" y2="98" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+      <line x1="540" y1="98" x2="557" y2="98" stroke="#6b7280" stroke-width="2"/>
+      <line x1="611" y1="98" x2="653" y2="98" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+      <line x1="785" y1="98" x2="823" y2="98" stroke="#6b7280" stroke-width="2" marker-end="url(#arr)"/>
+
+      <!-- 残差侧支：obs_r -> 残差策略 -> δ -->
+      <rect x="180" y="240" width="130" height="56" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="245" y="264" text-anchor="middle" font-size="13" fill="#e65100" font-weight="700">obs_r</text>
+      <text x="245" y="282" text-anchor="middle" font-size="11" fill="#555">(12 维，任务相关)</text>
+
+      <rect x="360" y="230" width="150" height="76" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="435" y="256" text-anchor="middle" font-size="14" fill="#e65100" font-weight="700">残差策略 MLP</text>
+      <text x="435" y="274" text-anchor="middle" font-size="11" fill="#555">12→64→64→(3,1)</text>
+      <text x="435" y="292" text-anchor="middle" font-size="11" fill="#888">🟠 2.3 万参数 · 可训练</text>
+
+      <rect x="560" y="248" width="60" height="40" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="590" y="272" text-anchor="middle" font-size="14" fill="#e65100" font-weight="700">δ(3)</text>
+
+      <line x1="310" y1="268" x2="358" y2="268" stroke="#e65100" stroke-width="2" marker-end="url(#arrB)"/>
+      <line x1="510" y1="268" x2="558" y2="268" stroke="#e65100" stroke-width="2" marker-end="url(#arrB)"/>
+
+      <!-- δ 上抛到主链的 +δ -->
+      <path d="M 590 248 C 590 200, 585 150, 585 126" stroke="#e65100" stroke-width="2" fill="none" marker-end="url(#arrB)" stroke-dasharray="4 3"/>
+
+      <!-- obs_r 来源标注 -->
+      <text x="180" y="330" font-size="11" fill="#888">obs_r 由 read_fit / predict_intercept / site 位姿组装（世界系）</text>
+    </svg>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin:8px 0 0">δ 加在 <code>nn_action[26:29]</code>（右腕 roll/pitch/yaw）、<code>nn2motor</code> 之前 —— 这样残差随 <code>last_action</code> 反馈进下一帧观测，复刻 LATENT「低层对腕部修正鲁棒」的闭环结构。</p>
+  </div>
+
+  <!-- 3. 残差观测 obs_r -->
+  <h2><span class="n">3</span> 残差观测 obs_r（12 维）</h2>
+  <div class="card">
+    <table>
+      <tr><th>分量</th><th>公式</th><th>含义</th><th>掩码</th></tr>
+      <tr><td><code>inter_err</code> (3)</td><td><code>inter_p − site_pos</code></td><td>预测拦截点 vs 当前拍点（核心误差）</td><td>ready &amp; found</td></tr>
+      <tr><td><code>t_arr</code> (1)</td><td>—</td><td>预测到达时刻（秒）</td><td>found</td></tr>
+      <tr><td><code>ball_rel</code> (3)</td><td><code>ball_pos − site_pos</code></td><td>当前球 vs 拍点</td><td>ready</td></tr>
+      <tr><td><code>ball_vel</code> (3)</td><td>—</td><td>拟合球速度（世界系）</td><td>ready</td></tr>
+      <tr><td><code>ready</code> / <code>found</code> (2)</td><td>—</td><td>拟合就绪 / 拦截点找到标志</td><td>—</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:13px;margin-top:12px">未就绪分量显式掩码为 0——避免 read_fit / predict_intercept 的 0 占位变成「~−site_pos」的伪误差污染共享躯干。</p>
+  </div>
+
+  <!-- 4. 残差策略网络 -->
+  <h2><span class="n">4</span> 残差策略：actor-critic</h2>
+  <div class="card">
+    <div class="svgbox">
+    <svg viewBox="0 0 760 230" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+      <defs>
+        <marker id="arrC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#e65100"/></marker>
+      </defs>
+      <!-- 层 -->
+      <rect x="20" y="80" width="110" height="60" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="75" y="106" text-anchor="middle" font-size="13" font-weight="700" fill="#e65100">obs_r</text>
+      <text x="75" y="124" text-anchor="middle" font-size="11" fill="#555">(12)</text>
+
+      <rect x="190" y="70" width="130" height="80" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="255" y="100" text-anchor="middle" font-size="13" font-weight="700" fill="#e65100">Dense 64</text>
+      <text x="255" y="120" text-anchor="middle" font-size="11" fill="#555">tanh</text>
+      <text x="255" y="138" text-anchor="middle" font-size="10" fill="#888">共享躯干</text>
+
+      <rect x="380" y="70" width="130" height="80" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="445" y="100" text-anchor="middle" font-size="13" font-weight="700" fill="#e65100">Dense 64</text>
+      <text x="445" y="120" text-anchor="middle" font-size="11" fill="#555">tanh</text>
+      <text x="445" y="138" text-anchor="middle" font-size="10" fill="#888">共享躯干</text>
+
+      <rect x="580" y="40" width="150" height="60" rx="8" fill="#fff3e0" stroke="#e65100"/>
+      <text x="655" y="62" text-anchor="middle" font-size="13" font-weight="700" fill="#e65100">mean (3)</text>
+      <text x="655" y="80" text-anchor="middle" font-size="11" fill="#555">tanh × 0.5</text>
+      <text x="655" y="94" text-anchor="middle" font-size="10" fill="#888">actor：δ = mean + std·ε</text>
+
+      <rect x="580" y="150" width="150" height="60" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+      <text x="655" y="172" text-anchor="middle" font-size="13" font-weight="700" fill="#1565c0">value (1)</text>
+      <text x="655" y="190" text-anchor="middle" font-size="11" fill="#555">线性</text>
+      <text x="655" y="204" text-anchor="middle" font-size="10" fill="#888">critic：GAE 用</text>
+
+      <line x1="130" y1="110" x2="188" y2="110" stroke="#e65100" stroke-width="2" marker-end="url(#arrC)"/>
+      <line x1="320" y1="110" x2="378" y2="110" stroke="#e65100" stroke-width="2" marker-end="url(#arrC)"/>
+      <line x1="510" y1="105" x2="578" y2="72" stroke="#e65100" stroke-width="2" marker-end="url(#arrC)"/>
+      <line x1="510" y1="120" x2="578" y2="180" stroke="#1565c0" stroke-width="2" marker-end="url(#arrC)"/>
+
+      <text x="600" y="24" font-size="12" fill="#e65100" font-weight="700">状态无关高斯探索：log_std (3) 可学习，clamp [-5,2]</text>
+    </svg>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px"><span class="pill orange">actor</span> 输出 δ（3 维）· <span class="pill blue">critic</span> 输出 value（GAE 优势估计用）——共享躯干，仅 ~2.3 万参数（对比冻结策略 292 万）。</p>
+  </div>
+
+  <!-- 5. 奖励 -->
+  <h2><span class="n">5</span> 奖励设计</h2>
+  <div class="card">
+    <table>
+      <tr><th>项</th><th>公式</th><th>权重</th><th>作用</th></tr>
+      <tr><td><code>r_close</code></td><td>峰值窗内 <code>−∥ball−site∥</code></td><td>1.0</td><td>引导拍面贴球（密度 shaping）</td></tr>
+      <tr><td><code>r_hit</code></td><td>终局命中，摊在最后 active 步</td><td>+5.0</td><td>稀疏主信号</td></tr>
+      <tr><td><code>r_act</code></td><td><code>−∥δ∥²</code></td><td>0.1</td><td>抑制过量腕部动作</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:13px;margin-top:12px">吸收态全掩码：done 后 reward=0，绝不计算窗外距离（球 park 于 100m 处会撑爆 value head）。</p>
+  </div>
+
+  <!-- 6. PPO -->
+  <h2><span class="n">6</span> PPO 训练配置</h2>
+  <div class="card grid2">
+    <div>
+      <h3>算法</h3>
+      <p>PPO-clip + GAE，状态无关高斯策略。三个关键正确性点：</p>
+      <ul style="font-size:14px;margin:0;padding-left:20px">
+        <li><strong>old_params 冻结</strong>：collect 后一次性算 logp_old，epoch 内不随更新变化</li>
+        <li><strong>门控步 logp 剔除</strong>：非激活步 δ 被掩为 0，其 logp 是伪值，不参与 loss</li>
+        <li><strong>GAE 吸收态 bootstrap=0</strong>：done 处 V=0，逐环境独立</li>
+      </ul>
+    </div>
+    <div>
+      <h3>超参</h3>
+      <table>
+        <tr><td>gamma / gae_lambda</td><td>0.99 / 0.95</td></tr>
+        <tr><td>clip / vf_coef / ent_coef</td><td>0.2 / 0.5 / 0.01</td></tr>
+        <tr><td>lr (Adam) / grad norm</td><td>3e-4 / 0.5</td></tr>
+        <tr><td>epochs / minibatch</td><td>3 / 2048</td></tr>
+        <tr><td>num_envs / total_iters</td><td>512 / 2000</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- 7. 训练循环 + 门控 -->
+  <h2><span class="n">7</span> 训练循环 + 门控</h2>
+  <div class="card">
+    <div class="svgbox">
+    <svg viewBox="0 0 900 120" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+      <defs>
+        <marker id="arrD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#6b7280"/></marker>
+      </defs>
+      <rect x="10" y="35" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+      <text x="85" y="57" text-anchor="middle" font-size="13" font-weight="700">collect</text>
+      <text x="85" y="74" text-anchor="middle" font-size="11" fill="#555">512 env rollout · noise_on=1</text>
+
+      <rect x="200" y="35" width="170" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+      <text x="285" y="57" text-anchor="middle" font-size="13" font-weight="700">host 重建</text>
+      <text x="285" y="74" text-anchor="middle" font-size="11" fill="#555">obs_r / mean / logp / reward</text>
+
+      <rect x="410" y="35" width="150" height="50" rx="8" fill="#e8f5e9" stroke="#2e7d32"/>
+      <text x="485" y="57" text-anchor="middle" font-size="13" font-weight="700">GAE + PPO 更新</text>
+      <text x="485" y="74" text-anchor="middle" font-size="11" fill="#555">3 epochs · minibatch 2048</text>
+
+      <rect x="600" y="35" width="150" height="50" rx="8" fill="#e3f2fd" stroke="#1565c0"/>
+      <text x="675" y="57" text-anchor="middle" font-size="13" font-weight="700">eval（每 10 iter）</text>
+      <text x="675" y="74" text-anchor="middle" font-size="11" fill="#555">noise_on=0 · 报命中率</text>
+
+      <rect x="790" y="35" width="100" height="50" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+      <text x="840" y="57" text-anchor="middle" font-size="13" font-weight="700">checkpoint</text>
+      <text x="840" y="74" text-anchor="middle" font-size="11" fill="#555">每 100 iter</text>
+
+      <line x1="160" y1="60" x2="198" y2="60" stroke="#6b7280" stroke-width="2" marker-end="url(#arrD)"/>
+      <line x1="370" y1="60" x2="408" y2="60" stroke="#6b7280" stroke-width="2" marker-end="url(#arrD)"/>
+      <line x1="560" y1="60" x2="598" y2="60" stroke="#6b7280" stroke-width="2" marker-end="url(#arrD)"/>
+      <line x1="750" y1="60" x2="788" y2="60" stroke="#6b7280" stroke-width="2" marker-end="url(#arrD)"/>
+
+      <text x="10" y="110" font-size="12" fill="#888">门控：δ 仅在 mode∈{ARM,SWING} 且 ready 且 active 时生效（IDLE/TRACK 零扰动）</text>
+    </svg>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px">训练/评估共用同一 jitted env，靠 <code>noise_on</code> 动态标量区分（train=1 注入探索噪声 / eval=0 确定性），零重编译。</p>
+  </div>
+
+  <!-- 8. 结果 -->
+  <h2><span class="n">8</span> 结果：命中率 62% → 93%</h2>
+  <div class="card">
+    <div class="svgbox">
+    <svg viewBox="0 0 900 300" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Microsoft YaHei,sans-serif">
+      <!-- 坐标轴 -->
+      <line x1="70" y1="250" x2="860" y2="250" stroke="#9ca3af" stroke-width="1"/>
+      <line x1="70" y1="250" x2="70" y2="20" stroke="#9ca3af" stroke-width="1"/>
+      <!-- 基线 62% 虚线 -->
+      <line x1="70" y1="95" x2="860" y2="95" stroke="#f9a825" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="70" y="88" font-size="12" fill="#f9a825" font-weight="700">零残差基线 62%</text>
+      <!-- y 轴刻度 -->
+      <text x="60" y="253" text-anchor="end" font-size="11" fill="#888">0%</text>
+      <text x="60" y="95" text-anchor="end" font-size="11" fill="#888">62%</text>
+      <text x="60" y="55" text-anchor="end" font-size="11" fill="#888">80%</text>
+      <text x="60" y="15" text-anchor="end" font-size="11" fill="#888">100%</text>
+
+      <!-- 数据点：iter -> 命中率（y = 250 - rate*2） -->
+      <!-- 0:62, 10:32.5, 20:52.5, 30:88, 50:93, 110:94.5, 200:94.5, 410:96, 690:96.5, 830:94.5 -->
+      <polyline fill="none" stroke="#2e7d32" stroke-width="2.5" points="
+        70,126  86,185  102,145  118,74  150,64  246,61  382,61  698,58  1098,57  1250,61"/>
+      <!-- 数据点圆圈 -->
+      <circle cx="70" cy="126" r="4" fill="#f9a825"/>
+      <circle cx="86" cy="185" r="4" fill="#e65100"/>
+      <circle cx="102" cy="145" r="4" fill="#e65100"/>
+      <circle cx="118" cy="74" r="4" fill="#2e7d32"/>
+      <circle cx="150" cy="64" r="4" fill="#2e7d32"/>
+      <circle cx="246" cy="61" r="4" fill="#2e7d32"/>
+      <circle cx="382" cy="61" r="4" fill="#2e7d32"/>
+      <circle cx="698" cy="58" r="4" fill="#2e7d32"/>
+      <circle cx="1098" cy="57" r="4" fill="#2e7d32"/>
+      <circle cx="1250" cy="61" r="4" fill="#2e7d32"/>
+
+      <!-- 标注 -->
+      <text x="70" y="118" text-anchor="middle" font-size="10" fill="#888">基线 62</text>
+      <text x="118" y="66" text-anchor="middle" font-size="11" fill="#2e7d32" font-weight="700">iter30 88%</text>
+      <text x="698" y="48" text-anchor="middle" font-size="11" fill="#2e7d32" font-weight="700">iter410 96%</text>
+      <text x="150" y="90" text-anchor="middle" font-size="10" fill="#e65100">iter10 32.5%（探索期）</text>
+
+      <!-- x 轴刻度 -->
+      <text x="70" y="270" text-anchor="middle" font-size="11" fill="#888">0</text>
+      <text x="250" y="270" text-anchor="middle" font-size="11" fill="#888">100</text>
+      <text x="450" y="270" text-anchor="middle" font-size="11" fill="#888">250</text>
+      <text x="650" y="270" text-anchor="middle" font-size="11" fill="#888">400</text>
+      <text x="850" y="270" text-anchor="middle" font-size="11" fill="#888">800</text>
+      <text x="450" y="288" text-anchor="middle" font-size="12" fill="#555">训练迭代（iter）</text>
+    </svg>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px">前 10 个迭代是探索期（随机噪声扰乱跟踪，命中率短暂跌到 32.5%），随后快速爬升，~30 迭代即超过 62% 基线，之后稳定在 90–96% 平台。σ=5mm 随机阻力完整设置。</p>
+  </div>
+
+  <footer>网球击球闭环 · 右腕残差 RL 设计思路 · 生成于 2026-09-10</footer>
+</div>
+</body>
+</html>
