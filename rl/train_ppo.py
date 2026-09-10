@@ -155,17 +155,18 @@ def collect(env, module, train_params, reset_key, gamma: float, lam: float):
         dict 含 obs_r/act/old_logp/adv/ret（均已按 gate 掩码展平为 (M, ...)）；
         M 可能为 0（本批无 ARM/SWING 步）。
     """
-    state, _extras = env.reset(reset_key)
+    state, extras = env.reset(reset_key)
     state = state._replace(res_params=train_params)
     final, tr = env.rollout(state)
     tr_np = jax.tree.map(np.asarray, tr)._asdict()
     fin_np = jax.tree.map(np.asarray, final)._asdict()
+    extras_np = jax.tree.map(np.asarray, extras)
 
     obs_r = rebuild_obs_r(tr_np)                        # (B,N,12)
     mean, value = forward(module, train_params.policy, obs_r)
     noise = tr_np["delta"] - mean                       # (B,N,3)
     logp = gaussian_logp_np(noise, np.asarray(train_params.log_std))  # (B,N)
-    rewards, _dones = RW.compute_rewards(env, tr_np, fin_np)
+    rewards, _dones = RW.compute_rewards(env, tr_np, fin_np, extras_np)
     adv, ret = gae(rewards, value, tr_np["active"], gamma, lam)
     gate = gate_mask(tr_np)
 

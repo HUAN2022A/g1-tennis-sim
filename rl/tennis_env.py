@@ -109,6 +109,12 @@ GROUND_Z = 0.05              # EARLY_GROUND 真值阈值
 PRED_DRAG_K = 0.0125         # 预测/拟合/发射设计共用阻力假设
 TRIGGER_BIAS_FRAMES = -2     # 触发时序偏置（dbf965f 正式修正）
 
+# 阶段 2（命中→落点）：球网 / 目标落点几何（对齐 scene_tennis.xml）
+NET_X = 3.0                  # 球网 x 坐标（<body name="net" pos="3 0 0">）
+NET_HEIGHT = 0.914           # 网高（net_band pos z=0.914）
+LANDING_X_LO, LANDING_X_HI = 4.0, 10.0     # 目标落点 x 采样域（对方半场，网后 1m 到底线前）
+LANDING_Y_LO, LANDING_Y_HI = -4.0, 4.0     # 目标落点 y 采样域（单打场内）
+
 # 模式 / 结果枚举
 MODE_IDLE, MODE_TRACK, MODE_ARM, MODE_SWING, MODE_DONE = 0, 1, 2, 3, 4
 OUT_NONE, OUT_HIT, OUT_MISS, OUT_NOSWING, OUT_EARLY = 0, 1, 2, 3, 4
@@ -680,8 +686,8 @@ class TennisEnv:
     def _reset(self, rng: jax.Array):
         B = self.num_envs
         keys = jrandom.split(rng, B)                 # (B, 2)
-        ks3 = jax.vmap(lambda k: jrandom.split(k, 3))(keys)   # (B, 3, 2)
-        k_serve, k_dr, k_stream = ks3[:, 0], ks3[:, 1], ks3[:, 2]
+        ks4 = jax.vmap(lambda k: jrandom.split(k, 4))(keys)   # (B, 4, 2)
+        k_serve, k_dr, k_stream, k_landing = ks4[:, 0], ks4[:, 1], ks4[:, 2], ks4[:, 3]
         ks4 = jax.vmap(lambda k: jrandom.split(k, 4))(k_serve)  # (B, 4, 2)
         u_r = _uniform(ks4[:, 0], ())
         u_th = _uniform(ks4[:, 1], ())
@@ -704,6 +710,14 @@ class TennisEnv:
         mass_scale = DR_MASS_LO + (DR_MASS_HI - DR_MASS_LO) * u_m
         fric = DR_FRIC_LO + (DR_FRIC_HI - DR_FRIC_LO) * u_f
         rest = DR_REST_LO + (DR_REST_HI - DR_REST_LO) * u_rest
+
+        # 目标落点采样（阶段 2 命中→落点）：对方半场随机目标（世界系 xy）
+        kl2 = jax.vmap(lambda k: jrandom.split(k, 2))(k_landing)  # (B, 2, 2)
+        u_lx = _uniform(kl2[:, 0], ())
+        u_ly = _uniform(kl2[:, 1], ())
+        target_x = LANDING_X_LO + (LANDING_X_HI - LANDING_X_LO) * u_lx
+        target_y = LANDING_Y_LO + (LANDING_Y_HI - LANDING_Y_LO) * u_ly
+        target_landing = jnp.stack([target_x, target_y], axis=-1)  # (B, 2)
 
         # 机器人复位到 onset 帧（root 速度清零），球 park 到待命位
         robot_q = jnp.broadcast_to(self.ref_qpos[self.onset], (B, 36))
@@ -736,7 +750,8 @@ class TennisEnv:
         )
         extras = {"serve_pos": serve_pos, "serve_vel": serve_vel,
                   "serve_target": target, "T_flight": T_flight,
-                  "launch_step": launch_step, "k_drag": k_drag}
+                  "launch_step": launch_step, "k_drag": k_drag,
+                  "target_landing": target_landing}
         return state, extras
 
     # ------------------------------------------------------------------

@@ -96,13 +96,15 @@ def test_reward_masking():
         "delta": np.zeros((B, N, 3), np.float32),
     }
     fin = {"hit": np.zeros(B, bool)}
-    r, d = RW.compute_rewards(E(), tr, fin)
-    assert np.all(r == 0.0), f"IDLE/窗外 reward 必须全 0（不能算 100m 距离），得 {r}"
+    extras = {"target_landing": np.array([[7.0, 0.0], [7.0, 0.0]], np.float32)}
+    r, d = RW.compute_rewards(E(), tr, fin, extras)
+    # 中间步（非最后 active）：r_close 归零（球 park 100m 不产生距离惩罚）+ r_act=0
+    assert np.all(r[:, :4] == 0.0), f"中间步 reward 应 0（窗外距离不进 return），得 {r}"
     assert not d.any()
     tr["active"][0, 4] = False
-    r, _ = RW.compute_rewards(E(), tr, fin)
-    assert np.all(r[0] == 0.0), "未激活步 reward 应 0"
-    print("  reward: 窗外/未激活步严格归零")
+    r, _ = RW.compute_rewards(E(), tr, fin, extras)
+    assert r[0, 4] == 0.0, "未激活步 reward 应 0"
+    print("  reward: 窗外/未激活步严格归零（落点/过网只摊最后 active 步）")
 
 
 def test_r_hit_placement():
@@ -112,22 +114,52 @@ def test_r_hit_placement():
         peak_local = 10
 
     B, N = 2, 4
+    # 球落在目标落点 [5,0]（过网，land_dist=0）；site=ball 使 r_close=0
     tr = {
         "active": np.array([[True, True, False, False],
                             [True, True, True, False]]),
         "mode": np.full((B, N), te.MODE_SWING, int),
-        "swing_f": np.full((B, N), 100, int),     # swing_f-onset=0 → 峰值窗内
-        "ball_pos": np.zeros((B, N, 3), np.float32),  # dist=0 → r_close=0
-        "site_pos": np.zeros((B, N, 3), np.float32),
+        "swing_f": np.full((B, N), 100, int),
+        "ball_pos": np.full((B, N, 3), [5.0, 0.0, 0.0], np.float32),
+        "site_pos": np.full((B, N, 3), [5.0, 0.0, 0.0], np.float32),
         "delta": np.zeros((B, N, 3), np.float32),
     }
     fin = {"hit": np.array([True, False])}
-    r, _ = RW.compute_rewards(E(), tr, fin)
-    # env0 hit=True：最后一个 active 步（index 1）应 +5
-    assert r[0, 1] == 5.0, f"hit env 最后 active 步应 +5，得 {r[0]}"
-    assert np.all(r[0, :1] == 0.0) and np.all(r[0, 2:] == 0.0)
-    assert np.all(r[1] == 0.0), f"miss env 应全 0，得 {r[1]}"
-    print("  r_hit: 命中 env 最后 active 步 +5，miss env 全 0")
+    extras = {"target_landing": np.array([[5.0, 0.0], [5.0, 0.0]], np.float32)}
+    r, _ = RW.compute_rewards(E(), tr, fin, extras)
+    # env0 hit=True：最后 active 步(1) = r_hit(+5) + r_landing(0) + r_net(+1) = 6
+    # env1 miss：    最后 active 步(2) = 0 + 0 + 1 = 1；差值 = r_hit 的 +5
+    assert abs((r[0, 1] - r[1, 2]) - 5.0) < 1e-5, f"hit vs miss 应差 +5，得 {r[0]}, {r[1]}"
+    assert np.all(r[0, :1] == 0.0), "中间步（非最后 active）应 0"
+    print("  r_hit: 命中 env 比 miss env 多 +5（r_hit 在最后 active 步）")
+
+
+def test_landing_net():
+    class E:
+        swing_end = 200
+        onset = 100
+        peak_local = 10
+
+    B, N = 2, 3
+    ball = np.zeros((B, N, 3), np.float32)
+    ball[0, :] = [5.0, 0.0, 0.0]      # env0 落地 x=5（过网）
+    ball[1, :] = [1.0, 0.0, 0.0]      # env1 落地 x=1（下网）
+    tr = {
+        "active": np.ones((B, N), bool),
+        "mode": np.full((B, N), te.MODE_SWING, int),
+        "swing_f": np.full((B, N), 100, int),
+        "ball_pos": ball,
+        "site_pos": ball.copy(),        # dist=0 → r_close=0
+        "delta": np.zeros((B, N, 3), np.float32),
+    }
+    fin = {"hit": np.zeros(B, bool)}
+    extras = {"target_landing": np.array([[5.0, 0.0], [1.0, 0.0]], np.float32)}
+    r, _ = RW.compute_rewards(E(), tr, fin, extras)
+    # 过网 env0：r_net=+1, r_landing=0（land_dist=0）→ 最后步 +1
+    # 下网 env1：r_net=-1, r_landing=-10（0.5*LANDING_PENALTY 20）→ 最后步 -11
+    assert r[0, 2] == 1.0, f"过网球最后步应 +1，得 {r[0]}"
+    assert r[1, 2] == -11.0, f"下网球最后步应 -11，得 {r[1]}"
+    print("  landing/net: 过网 +1，下网 -11（-1 过网 + -10 落点惩罚）")
 
 
 def test_gate_mask_exclusion():
@@ -256,6 +288,7 @@ TESTS = [
     test_gae_absorbing,
     test_reward_masking,
     test_r_hit_placement,
+    test_landing_net,
     test_gate_mask_exclusion,
     test_collect_finite,
     test_ppo_update_finite,
