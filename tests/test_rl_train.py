@@ -55,16 +55,18 @@ def test_residual_shapes():
 
 
 def test_make_obs_r_masks_garbage():
-    Ctx = namedtuple("Ctx", "inter_p site_pos t_arr ball_pos ball_vel ready found")
+    Ctx = namedtuple("Ctx", "inter_p site_pos t_arr ball_pos ball_vel ready found target_landing")
     B = 3
     ctx = Ctx(inter_p=jnp.zeros((B, 3)), site_pos=jnp.ones((B, 3)),
               t_arr=jnp.zeros((B,)), ball_pos=jnp.zeros((B, 3)),
               ball_vel=jnp.zeros((B, 3)),
-              ready=jnp.zeros((B,), jnp.bool_), found=jnp.zeros((B,), jnp.bool_))
+              ready=jnp.zeros((B,), jnp.bool_), found=jnp.zeros((B,), jnp.bool_),
+              target_landing=jnp.zeros((B, 2)))
     o = R.make_obs_r(ctx)
     assert jnp.all(o[:, :10] == 0.0), "未就绪/未找到时 fit/inter 分量必须归零（非 -site_pos 伪误差）"
     assert jnp.all(o[:, 10:] == 0.0)
-    ctx2 = ctx._replace(ready=jnp.ones((B,), jnp.bool_), found=jnp.ones((B,), jnp.bool_))
+    ctx2 = ctx._replace(ready=jnp.ones((B,), jnp.bool_), found=jnp.ones((B,), jnp.bool_),
+                        target_landing=jnp.zeros((B, 2)))
     o2 = R.make_obs_r(ctx2)
     assert jnp.all(o2[:, 0:3] == -1.0), "inter_err = inter_p - site_pos 应生效"
     print("  make_obs_r: 未就绪掩码归零，就绪时 inter_err 生效")
@@ -134,32 +136,66 @@ def test_r_hit_placement():
     print("  r_hit: 命中 env 比 miss env 多 +5（r_hit 在最后 active 步）")
 
 
-def test_landing_net():
+def test_net_clearance_reward():
     class E:
         swing_end = 200
         onset = 100
         peak_local = 10
 
-    B, N = 2, 3
+    B, N = 3, 4
+    x = np.array([1.0, 2.5, 3.5, 5.0], np.float32)
     ball = np.zeros((B, N, 3), np.float32)
-    ball[0, :] = [5.0, 0.0, 0.0]      # env0 落地 x=5（过网）
-    ball[1, :] = [1.0, 0.0, 0.0]      # env1 落地 x=1（下网）
+    ball[0, :, 0] = x
+    ball[0, :, 2] = [0.5, 0.8, 1.05, 1.0]    # upward cross x=3 at z≈0.925 → clearance +0.011 > 0
+    ball[1, :, 0] = x
+    ball[1, :, 2] = [0.5, 0.75, 0.80, 0.75]  # cross at z≈0.775 → clearance -0.139 < 0
+    ball[2, :, 0] = 10.0                      # never crosses → fallback
     tr = {
         "active": np.ones((B, N), bool),
         "mode": np.full((B, N), te.MODE_SWING, int),
         "swing_f": np.full((B, N), 100, int),
         "ball_pos": ball,
-        "site_pos": ball.copy(),        # dist=0 → r_close=0
+        "site_pos": ball.copy(),
         "delta": np.zeros((B, N, 3), np.float32),
     }
     fin = {"hit": np.zeros(B, bool)}
-    extras = {"target_landing": np.array([[5.0, 0.0], [1.0, 0.0]], np.float32)}
+    extras = {"target_landing": np.array([[5.0, 0.0], [5.0, 0.0], [10.0, 0.0]], np.float32)}
     r, _ = RW.compute_rewards(E(), tr, fin, extras)
-    # 过网 env0：r_net=+1, r_landing=0（land_dist=0）→ 最后步 +1
-    # 下网 env1：r_net=-1, r_landing=-10（0.5*LANDING_PENALTY 20）→ 最后步 -11
-    assert r[0, 2] == 1.0, f"过网球最后步应 +1，得 {r[0]}"
-    assert r[1, 2] == -11.0, f"下网球最后步应 -11，得 {r[1]}"
-    print("  landing/net: 过网 +1，下网 -11（-1 过网 + -10 落点惩罚）")
+    assert r[0, 3] > 0.0, f"过网 clear 应 >0，得 {r[0]}"
+    assert r[1, 3] < 0.0, f"下网应 <0，得 {r[1]}"
+    assert r[0, 3] > r[1, 3] > r[2, 3], f"clear>下网>未过网，得 {r[:, 3]}"
+    assert r[1, 3] > -3.0, f"断崖已移除（下网不应有 -10 级惩罚），得 {r[1]}"
+    print("  net_clearance: 过网单调 >0，下网 <0 且无断崖")
+
+
+def test_landing_xy():
+    # lands mid-trace: first frame with z<0.05 wins
+    b = np.zeros((1, 4, 3), np.float32)
+    b[0, :, 2] = [0.30, 0.20, 0.02, 0.01]
+    b[0, 2, :2] = [5.0, -1.0]
+    xy = RW.landing_xy(b)
+    assert np.allclose(xy, [[5.0, -1.0]]), f"取首个 z<0.05 的 xy，得 {xy}"
+    # never lands: fall back to last frame
+    b2 = np.zeros((1, 3, 3), np.float32)
+    b2[0, :, 2] = 2.0
+    b2[0, 2, :2] = [7.0, 2.0]
+    xy2 = RW.landing_xy(b2)
+    assert np.allclose(xy2, [[7.0, 2.0]]), f"未落地取最后一帧，得 {xy2}"
+    print("  landing_xy: 首个 z<0.05 帧 / 未落地回退末帧")
+
+
+def test_net_cross_z():
+    b = np.zeros((1, 3, 3), np.float32)
+    b[0, :, 0] = [2.0, 3.6, 6.0]
+    b[0, :, 2] = [0.4, 1.0, 0.9]
+    zc, crossed = RW.net_cross_z(b, np.ones((1, 3), bool))
+    assert bool(crossed[0]), "应判定过网"
+    assert abs(float(zc[0]) - 0.775) < 1e-4, f"线性插值 z 应≈0.775，得 {zc[0]}"
+    b2 = np.zeros((1, 3, 3), np.float32)
+    b2[0, :, 0] = 1.0
+    _, crossed2 = RW.net_cross_z(b2, np.ones((1, 3), bool))
+    assert not bool(crossed2[0]), "未过网应 crossed=False"
+    print("  net_cross_z: 向上穿越插值 z / 未过网 False")
 
 
 def test_gate_mask_exclusion():
@@ -288,7 +324,9 @@ TESTS = [
     test_gae_absorbing,
     test_reward_masking,
     test_r_hit_placement,
-    test_landing_net,
+    test_net_clearance_reward,
+    test_net_cross_z,
+    test_landing_xy,
     test_gate_mask_exclusion,
     test_collect_finite,
     test_ppo_update_finite,

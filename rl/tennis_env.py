@@ -62,6 +62,7 @@ from jax import random as jrandom
 
 from rl import ball_obs_jax as bj
 from rl import frozen_policy as fp
+from rl import reward as RW
 from tracking import constants as consts
 from utils.tennis_scene import load_tennis_model
 
@@ -219,6 +220,7 @@ class ResidualCtx(NamedTuple):
     active: jax.Array          # (B,) bool 本步是否有效（= ~done0；挥拍耗尽/NO_SWING
                                #   后为 False，供残差门控抑制无梯度信号的尾部扰动）
     rng: jax.Array             # (B,2) 本步 state.rng（观测噪声流 key，只读）
+    target_landing: jax.Array  # (B,2) 本回合目标落点（残差 obs / host 重建用）
 
 
 class EnvState(NamedTuple):
@@ -246,6 +248,7 @@ class EnvState(NamedTuple):
     ball_inertia_scale: jax.Array  # (B,) 球惯量缩放（= 质量缩放）
     ball_fric: jax.Array       # (B,) 球滑动摩擦
     ball_solref1: jax.Array    # (B,) 球 solref 阻尼（反弹强度）
+    target_landing: jax.Array  # (B,2) 本回合目标落点（残差 obs / host 重建用）
     # ---- T4 残差参数 carry ----
     # 残差策略参数走 scan carry 而非闭包：jax.jit 把闭包数组烤成常量，参数
     # 每迭代更新会导致整图重编译；carry 是 pytree 值语义，结构稳定即零重编译。
@@ -280,6 +283,7 @@ class StepTrace(NamedTuple):
     fit_found: jax.Array       # (B,) bool
     delta: jax.Array           # (B, 3) 本步施加的腕残差（零残差 = 0）
     rng: jax.Array             # (B, 2) 本步 state.rng（残差探索噪声重放）
+    target_landing: jax.Array  # (B,2) 本回合目标落点（残差 obs / host 重建用）
 
 
 def _gvec(quat_wxyz: jax.Array) -> jax.Array:
@@ -571,7 +575,8 @@ class TennisEnv:
                 inter_p=fit_inter, t_arr=fit_tarr, found=fit_found,
                 site_pos=site_pos_pre, root_pos=root_pos, root_yaw=root_yaw,
                 ep_step=state.ep_step, launch_step=state.launch_step,
-                mode=mode, active=active, rng=state.rng)
+                mode=mode, active=active, rng=state.rng,
+                target_landing=state.target_landing)
             delta = jnp.asarray(residual_fn(obs, ctx, state.res_params),
                                 dtype=jnp.float32)
             nn_action = nn_action.at[:, 26:29].add(delta)
@@ -657,6 +662,7 @@ class TennisEnv:
             ball_mass=state.ball_mass,
             ball_inertia_scale=state.ball_inertia_scale,
             ball_fric=state.ball_fric, ball_solref1=state.ball_solref1,
+            target_landing=state.target_landing,
             res_params=state.res_params,   # T4：残差参数原样透传（carry）
         )
         trace = StepTrace(ball_pos=ball_pos,
@@ -668,7 +674,8 @@ class TennisEnv:
                           fit_pos=fit_pos, fit_vel=fit_vel,
                           fit_ready=fit_ready, inter_p=fit_inter,
                           t_arr=fit_tarr, fit_found=fit_found,
-                          delta=delta, rng=state.rng)
+                          delta=delta, rng=state.rng,
+                          target_landing=state.target_landing)
         return new_state, trace
 
     def _racket_ball_contact(self, data) -> jax.Array:
@@ -747,6 +754,7 @@ class TennisEnv:
             ball_mass=self.base_ball_mass * mass_scale,
             ball_inertia_scale=mass_scale, ball_fric=fric,
             ball_solref1=BASE_SOLREF_DAMP * (0.75 / rest) ** 2,
+            target_landing=target_landing,
         )
         extras = {"serve_pos": serve_pos, "serve_vel": serve_vel,
                   "serve_target": target, "T_flight": T_flight,
@@ -820,7 +828,8 @@ class TennisEnv:
         assert B == self.num_envs, "num_envs 与环境构造值不同需另建环境"
         n_batches = int(np.ceil(n_balls / B))
         rec = {k: [] for k in ["hit", "outcome", "tau", "min_dist", "T", "k",
-                               "launch", "trig_step", "target_dev", "tau_valid"]}
+                               "launch", "trig_step", "target_dev", "tau_valid",
+                               "landing_dist", "landing_x", "over_net", "net_z"]}
         t0 = time.time()
         for b in range(n_batches):
             key = jrandom.fold_in(jrandom.PRNGKey(seed), b)
@@ -877,6 +886,13 @@ class TennisEnv:
             rec["trig_step"].append(trig)
             rec["target_dev"].append(
                 float(np.linalg.norm(ex_np["serve_target"][e] - self.p_swing)))
+            landing = RW.landing_xy(np.asarray(ball, np.float32)[None])[0]   # (2,) landing xy
+            tl = np.asarray(ex_np["target_landing"][e], np.float32)          # (2,) target
+            rec["landing_dist"].append(float(np.linalg.norm(landing - tl)))
+            rec["landing_x"].append(float(landing[0]))
+            rec["over_net"].append(bool(landing[0] > NET_X))
+            zc, xd = RW.net_cross_z(np.asarray(ball, np.float32)[None], active[None])
+            rec["net_z"].append(float(zc[0]) if bool(xd[0]) else np.nan)
 
     def _summarize(self, rec, n_balls, wall, verbose) -> dict:
         hit = np.asarray(rec["hit"])
@@ -884,6 +900,10 @@ class TennisEnv:
         tau = np.asarray(rec["tau"], dtype=np.float64)
         tau_valid = tau == tau
         min_dist = np.asarray(rec["min_dist"], dtype=np.float64)
+        land_dist = np.asarray(rec["landing_dist"], dtype=np.float64)
+        over_net = np.asarray(rec["over_net"], dtype=bool)
+        net_z = np.asarray(rec["net_z"], dtype=np.float64)
+        net_z_valid = np.isfinite(net_z)
         n_hit = int(hit.sum())
         is_miss = outcome == OUT_MISS
         stats = {
@@ -902,6 +922,11 @@ class TennisEnv:
             if np.any(hit & ~np.isnan(min_dist)) else None,
             "min_dist_miss_mean": float(np.nanmean(min_dist[is_miss & ~np.isnan(min_dist)]))
             if np.any(is_miss & ~np.isnan(min_dist)) else None,
+            "land_dist_mean": float(np.mean(land_dist)) if len(land_dist) else None,
+            "land_dist_mean_hit": float(np.mean(land_dist[hit])) if np.any(hit) else None,
+            "land_dist_mean_over": float(np.mean(land_dist[over_net])) if np.any(over_net) else None,
+            "net_z_mean_over": float(np.mean(net_z[net_z_valid & over_net])) if np.any(net_z_valid & over_net) else None,
+            "over_net_rate": float(over_net.mean()) if len(over_net) else None,
             "wall_s": wall,
             "per_ball": {k: np.asarray(v) for k, v in rec.items()},
         }
@@ -917,6 +942,10 @@ class TennisEnv:
             print(f"  min site-ball dist: HIT {stats['min_dist_hit_mean']:.3f} m, "
                   f"MISS_SWUNG {stats['min_dist_miss_mean']:.3f} m "
                   f"[CPU V1 0.084/0.135]")
+            print(f"  landing: over-net {stats['over_net_rate']:.1%} | dist-to-target mean "
+                  f"ALL {stats['land_dist_mean']:.2f} m, HIT {fm(stats['land_dist_mean_hit'])} m, "
+                  f"OVER-NET {fm(stats['land_dist_mean_over'])} m, "
+                  f"net_z OVER-NET {fm(stats['net_z_mean_over'])} m")
             print(f"  wall {wall:.1f}s ({wall / max(stats['n'],1) * 1000:.0f} ms/ball, "
                   f"num_envs={self.num_envs})")
         return stats

@@ -9,7 +9,7 @@ LATENT 论文核心洞察：击球/落点精度的来源是"高层直接修正�
 
 本模块定义与 env 契约正交的纯组件（设计决策 D1-D6，见 docs/RL_STAGE1.md）：
 - D2 ResidualPolicy：obs_r -> (mean (B,3), value (B,1))，共享躯干 actor-critic。
-- D3 make_obs_r(ctx)：ResidualCtx -> (B,12) 紧凑残差观测（世界系，未就绪
+- D3 make_obs_r(ctx)：ResidualCtx -> (B,14) 紧凑残差观测（世界系，未就绪
   分量显式掩码为 0，避免把 read_fit/predict_intercept 的 0 占位当成真实误差）。
 - D1 ResidualParams / make_residual_fn：env 的 residual_fn 契约
     `(obs, ctx, params) -> δ (B,3)`；探索噪声由 ctx.rng fold_in 派生，经
@@ -33,7 +33,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-OBS_R_DIM = 12          # make_obs_r 输出维度
+OBS_R_DIM = 14          # make_obs_r 输出维度
 ACTION_R_DIM = 3        # 右腕 roll/pitch/yaw
 DEFAULT_DELTA_SCALE = 0.5
 DEFAULT_LOG_STD = -1.0  # 状态无关高斯 std 初值（exp(-1)≈0.37）
@@ -83,6 +83,7 @@ def make_obs_r(ctx) -> jax.Array:
         7:10  ball_vel·[ready]
         10    ready (0/1)
         11    found (0/1)
+        12:14 target_landing (世界系 xy，回合内常量，始终有效，无需掩码)
     """
     ready_f = ctx.ready.astype(jnp.float32)             # (B,)
     found_f = ctx.found.astype(jnp.float32)             # (B,)
@@ -91,9 +92,10 @@ def make_obs_r(ctx) -> jax.Array:
     t_arr = ctx.t_arr[..., None] * found_f[..., None]
     ball_rel = (ctx.ball_pos - ctx.site_pos) * ready_f[..., None]
     ball_vel = ctx.ball_vel * ready_f[..., None]
+    tgt = jnp.broadcast_to(ctx.target_landing.astype(jnp.float32), ready_f.shape + (2,))
     obs_r = jnp.concatenate([
         inter_err, t_arr, ball_rel, ball_vel,
-        ready_f[..., None], found_f[..., None],
+        ready_f[..., None], found_f[..., None], tgt,
     ], axis=-1)
     return obs_r.astype(jnp.float32)
 
@@ -185,7 +187,7 @@ def _smoke():
 
     from collections import namedtuple
     Ctx = namedtuple("Ctx", "inter_p site_pos t_arr ball_pos ball_vel "
-                            "ready found mode active rng")
+                            "ready found mode active rng target_landing")
     B = 4
     ctx = Ctx(
         inter_p=jnp.zeros((B, 3)), site_pos=jnp.zeros((B, 3)),
@@ -194,6 +196,7 @@ def _smoke():
         found=jnp.ones((B,), jnp.bool_), mode=jnp.full((B,), _MODE_SWING, jnp.int32),
         active=jnp.ones((B,), jnp.bool_),
         rng=jax.random.split(key, B),
+        target_landing=jnp.zeros((B, 2)),
     )
     obs_r = make_obs_r(ctx)
     assert obs_r.shape == (B, OBS_R_DIM), obs_r.shape

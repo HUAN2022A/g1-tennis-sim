@@ -53,7 +53,7 @@ from rl import tennis_env as te
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CKPT = REPO_ROOT / "storage/ckpts/rl/residual_ppo.pkl"
 
-CtxHost = namedtuple("CtxHost", "inter_p site_pos t_arr ball_pos ball_vel ready found")
+CtxHost = namedtuple("CtxHost", "inter_p site_pos t_arr ball_pos ball_vel ready found target_landing")
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +99,14 @@ def gae(rewards: np.ndarray, values: np.ndarray, active: np.ndarray,
 
 
 def rebuild_obs_r(tr_np: dict) -> np.ndarray:
-    """从 trace 的 ctx 分量重建 obs_r（(B, N, 12)）。
+    """从 trace 的 ctx 分量重建 obs_r（(B, N, 14)）。
 
     trace 字段到 ctx 的映射：inter_p/inter_p, site_pos/site_pos_pre,
     t_arr/t_arr, ball_pos/fit_pos, ball_vel/fit_vel, ready/fit_ready,
     found/fit_found（字段名不对称见 tennis_env 注释）。
     """
+    B, N = tr_np["active"].shape
+    tl = jnp.broadcast_to(jnp.asarray(tr_np["target_landing"], jnp.float32), (B, N, 2))
     ctx = CtxHost(
         inter_p=jnp.asarray(tr_np["inter_p"], jnp.float32),
         site_pos=jnp.asarray(tr_np["site_pos_pre"], jnp.float32),
@@ -113,6 +115,7 @@ def rebuild_obs_r(tr_np: dict) -> np.ndarray:
         ball_vel=jnp.asarray(tr_np["fit_vel"], jnp.float32),
         ready=jnp.asarray(tr_np["fit_ready"]),
         found=jnp.asarray(tr_np["fit_found"]),
+        target_landing=tl,
     )
     return np.asarray(jax.jit(R.make_obs_r)(ctx))
 
@@ -187,7 +190,8 @@ def eval_hit_rate(env, module, policy_params, log_std, n_balls: int, seed: int):
     B = env.num_envs
     n_batches = int(np.ceil(n_balls / B))
     rec = {k: [] for k in ["hit", "outcome", "tau", "min_dist", "T", "k",
-                           "launch", "trig_step", "target_dev", "tau_valid"]}
+                           "launch", "trig_step", "target_dev", "tau_valid",
+                           "landing_dist", "landing_x", "over_net", "net_z"]}
     t0 = time.time()
     for b in range(n_batches):
         key = jrandom.fold_in(jrandom.PRNGKey(seed), b)
