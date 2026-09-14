@@ -229,3 +229,14 @@ sudo docker exec -d hgpt-rl bash -c "cd /workspace/Humanoid-GPT && JAX_DEFAULT_M
 7. **C1 数字极易被断章引用**：headline 从 3.45→~0.9–1.3 m 极易被读成"改进 2.5 m"。三值并列（`D_full / D_geo / D_obs`）纪律必须严格执行，否则"重定义"就伪装成"改进"。
 8. **未验证项**：肩/肘对落点的净权限完全未测；PD/力矩饱和（`TORQUE_LIMIT[22]=25 Nm`）未验证；C2 是否为 curriculum trap 未知；`SALT` 常量与 `DEFAULT_DELTA_SCALE_VEC` 具体值待定（实现时须补齐）。
 9. **评测可比性纪律**：动作空间变化后 hit/over-net 仍同 env 可比，但须固定同 seed 与 200/1000 球口径；C2 评估必须 `curriculum=1.0` 固定全框。
+
+---
+
+## 7. 与 LATENT 论文的同口径对比（SR@2.5m）
+
+在论文同口径（回球落点距目标 ≤2.5 m 的比例，SR@2.5）下，基线 ckpt `residual_clear_aim.pkl`（1000 球）
+为 **15.6%（156/1000）**，过网球口径 **26.3%（136/518）**；LATENT 论文仿真正手为 **96.5%**，
+差距约 **6×**（过网口径仍约 1/4）。该差距是**结构性**的（动作权限），reward 调参 / 几何重定义均无法闭合。
+完整口径对照、SR 曲线、三条根因证据与复现方式见 `docs/LATENT_SR_COMPARISON.md`。
+
+> 口径警告：本方案中的"命中率 96%"是拍-球**接触**率，**不是**落点精度，不可与论文 **96.5%** 的 SR 混用。
